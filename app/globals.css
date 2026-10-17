@@ -1,4 +1,4 @@
-/* ---------- Base ---------- */
+﻿/* ---------- Base ---------- */
 :root {
   --accent: #58cc02;
   --accent-dark: #58a700;
@@ -903,34 +903,6 @@ button:disabled { cursor: not-allowed; }
 .gpopup-head div { display: flex; flex-direction: column; line-height: 1.25; }
 .gpopup-head b { font-size: 15px; color: #202124; }
 .gpopup-head small { font-size: 12px; font-weight: 700; color: #5f6368; }
-.gpopup-title { margin: 14px 0 8px; font-size: 18px; font-weight: 800; color: #202124; }
-.gaccount {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #dadce0;
-  border-radius: 12px;
-  background: #fff;
-  text-align: left;
-  transition: background 0.12s;
-}
-.gaccount:hover { background: #f1f3f4; }
-.gaccount-avatar {
-  display: grid; place-items: center;
-  flex: none;
-  width: 36px; height: 36px;
-  border-radius: 50%;
-  background: #1a73e8;
-  color: #fff;
-  font-weight: 900;
-}
-.gaccount-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
-.gaccount-text b { font-size: 14px; color: #202124; }
-.gaccount-text small { font-size: 12px; font-weight: 700; color: #5f6368; overflow-wrap: anywhere; }
-.gpopup-note { margin: 12px 0 4px; font-size: 11px; font-weight: 700; line-height: 1.4; color: #80868b; }
-.gpopup-cancel { margin-top: 4px; padding: 6px 4px; border: none; background: none; font-size: 14px; font-weight: 800; color: #1a73e8; }
 .gpopup-loading { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 26px 0 10px; }
 .gpopup-loading p { margin: 0; font-weight: 800; color: #5f6368; }
 .spinner {
@@ -973,3 +945,6 @@ button:disabled { cursor: not-allowed; }
   .boot-pi, .boot-name, .boot-dots span, .app-content, .modal, .gpopup { animation: none; }
   .boot { transition: none; }
 }
+
+.google-error { margin: 10px 0 0; }
+.google-btn:disabled { opacity: 0.7; cursor: wait; }

@@ -52,68 +52,19 @@ export async function isUsernameTakenInCloud(username) {
 }
 
 /* ========================================================================
-   GOOGLE SIGN-IN
+   GOOGLE SIGN-IN  ->  now LIVE in app/page.js (Supabase OAuth)
    ======================================================================== */
 
-// The fake Google account offered by the simulated popup.
-export const SIMULATED_GOOGLE_PROFILE = {
-  name: "Alex Morgan",
-  email: "alex.morgan@example.com",
-};
-
-/**
- * Simulated Google OAuth popup result. Resolves with the Google profile
- * ({ name, email }) after a short delay, like a real popup would.
- *
- * ── OPTION A: NextAuth.js (Auth.js) ───────────────────────────────────────
- *  1. npm i next-auth
- *  2. Google Cloud Console → APIs & Services → Credentials → "OAuth client ID"
- *     (type: Web). Authorized redirect URI:
- *       http://localhost:3000/api/auth/callback/google   (and your prod URL)
- *  3. .env.local
- *       GOOGLE_CLIENT_ID=xxxxxxxx.apps.googleusercontent.com
- *       GOOGLE_CLIENT_SECRET=xxxxxxxx
- *       NEXTAUTH_SECRET=<openssl rand -base64 32>
- *       NEXTAUTH_URL=http://localhost:3000
- *  4. app/api/auth/[...nextauth]/route.js
- *       import NextAuth from "next-auth";
- *       import GoogleProvider from "next-auth/providers/google";
- *       const handler = NextAuth({
- *         providers: [GoogleProvider({
- *           clientId: process.env.GOOGLE_CLIENT_ID,
- *           clientSecret: process.env.GOOGLE_CLIENT_SECRET,
- *         })],
- *       });
- *       export { handler as GET, handler as POST };
- *  5. Wrap the app in <SessionProvider> (client component) and replace this
- *     function with:   signIn("google")          // from "next-auth/react"
- *     Read the user with useSession(): session.user.name / .email / .image
- *     and sign out with signOut().
- *
- * ── OPTION B: Supabase ────────────────────────────────────────────────────
- *  1. npm i @supabase/supabase-js
- *  2. Supabase dashboard → Authentication → Providers → Google: paste the
- *     Google OAuth client ID + secret from Google Cloud Console. Add the
- *     callback URL Supabase shows you to Google's authorized redirect URIs.
- *  3. .env.local
- *       NEXT_PUBLIC_SUPABASE_URL=https://<project>.supabase.co
- *       NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>
- *  4. Replace this function with:
- *       await supabase.auth.signInWithOAuth({
- *         provider: "google",
- *         options: { redirectTo: window.location.origin },
- *       });
- *     After the redirect, read the user with supabase.auth.getUser() →
- *     user.user_metadata.full_name / user.email, and listen for changes with
- *     supabase.auth.onAuthStateChange(...). Sign out: supabase.auth.signOut().
- *
- * With either option the Google "client ID" is public, the "client secret"
- * must only ever live in server-side env vars.
- */
-export async function signInWithGoogle() {
-  await new Promise((resolve) => setTimeout(resolve, 1100));
-  return { ...SIMULATED_GOOGLE_PROFILE };
-}
+// The simulated popup was removed. Real Google login lives in page.js:
+//   handleGoogleLogin()  -> supabase.auth.signInWithOAuth({ provider: "google" })
+//   auth listener effect -> supabase.auth.getSession() + onAuthStateChange()
+//   handleSignOut()      -> supabase.auth.signOut()
+// Dashboard setup (Google provider, redirect URLs) is documented at the top of
+// page.js, next to the createClient() call.
+//
+// Prefer NextAuth.js instead? `npm i next-auth`, add GoogleProvider in
+// app/api/auth/[...nextauth]/route.js (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET),
+// then use signIn("google") / useSession() / signOut() from "next-auth/react".
 
 /* ========================================================================
    FRIENDS LEAGUE (multi-tenant data)

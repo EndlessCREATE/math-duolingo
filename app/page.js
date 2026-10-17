@@ -1,15 +1,44 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 import { questions as fallbackQuestions } from "./questions";
 import { parseQuestionsFromCSV } from "./sheet";
-import {
-  fetchFriendsLeague,
-  isUsernameTakenInCloud,
-  signInWithGoogle,
-  SIMULATED_GOOGLE_PROFILE,
-  syncProfileToCloud,
-} from "./cloud";
+import { fetchFriendsLeague, isUsernameTakenInCloud, syncProfileToCloud } from "./cloud";
+
+/* ========================================================================
+   SUPABASE CLIENT (real Google OAuth)
+
+   Keys live in .env.local (never commit the file — it's git-ignored):
+     NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+     NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon / publishable key>
+   The anon key is designed to be public; security comes from Row Level
+   Security policies on your tables, NOT from hiding this key. Restart
+   `npm run dev` after editing .env.local.
+
+   One-time Supabase dashboard setup for Google login:
+     1. Authentication → Providers → Google → enable, paste the Google
+        OAuth Client ID + Secret (Google Cloud Console → Credentials).
+     2. In Google Cloud Console add this "Authorized redirect URI":
+          https://<project-ref>.supabase.co/auth/v1/callback
+     3. Authentication → URL Configuration → add your site to "Redirect URLs":
+          http://localhost:3000   (and your production URL)
+   ======================================================================== */
+
+// (If the env vars are missing the client is null: the app still works, and the
+// Google button shows a "not configured" message instead of crashing the page.)
+const supabase =
+  process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    ? createClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL,
+        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+      )
+    : null;
+
+// Ids of accounts that came from a real Supabase (Google) session start with this.
+const GOOGLE_ID_PREFIX = "google:";
+// Fake account created by the old simulated popup; purged on load (see below).
+const SIMULATED_ACCOUNT_ID = "google:alex.morgan@example.com";
 
 /* ========================================================================
    CONSTANTS
@@ -235,15 +264,16 @@ function GoogleIcon({ size = 20 }) {
  * "Log-In / Register" dialog.
  *   - Username tab: pick a unique username (no password in this local demo —
  *     a real backend would add email/password, magic link or OAuth).
- *   - "Sign in with Google": SIMULATED popup. To make it real, follow the
- *     NextAuth.js / Supabase steps documented on `signInWithGoogle` in
- *     app/cloud.js (that is the one place to paste your Google client ID).
+ *   - "Sign in with Google": REAL Supabase OAuth. `onGoogleLogin` (handleGoogleLogin
+ *     in <Page/>) calls supabase.auth.signInWithOAuth, which redirects the browser
+ *     to Google; on return the auth listener in <Page/> picks up the session.
  */
-function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
+function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
   const [mode, setMode] = useState("register"); // "register" | "login"
   const [username, setUsername] = useState("");
   const [error, setError] = useState("");
-  const [googleStage, setGoogleStage] = useState(null); // null | "choose" | "connecting"
+  const [googleError, setGoogleError] = useState("");
+  const [redirecting, setRedirecting] = useState(false); // true while handing off to Google
   const inputRef = useRef(null);
 
   useEffect(() => {
@@ -252,14 +282,12 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
 
   useEffect(() => {
     function onKey(e) {
-      if (e.key !== "Escape") return;
-      if (googleStage === "connecting") return;
-      if (googleStage === "choose") setGoogleStage(null);
-      else onClose();
+      if (e.key !== "Escape" || redirecting) return;
+      onClose();
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [googleStage, onClose]);
+  }, [redirecting, onClose]);
 
   async function submit(e) {
     e.preventDefault();
@@ -268,14 +296,13 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
     if (!res.ok) setError(res.error);
   }
 
-  async function pickGoogleAccount() {
-    setGoogleStage("connecting");
-    try {
-      const profile = await signInWithGoogle();
-      onGoogleSuccess(profile); // closes the modal
-    } catch {
-      setError("Google sign-in failed. Please try again.");
-      setGoogleStage(null);
+  async function startGoogleLogin() {
+    setGoogleError("");
+    setRedirecting(true);
+    const res = await onGoogleLogin(); // on success the browser navigates to Google
+    if (!res.ok) {
+      setGoogleError(res.error);
+      setRedirecting(false);
     }
   }
 
@@ -290,10 +317,18 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
           <p>Save your streak &amp; XP and climb your friends&apos; league.</p>
         </div>
 
-        <button type="button" className="google-btn" onClick={() => setGoogleStage("choose")}>
+        <button
+          type="button"
+          className="google-btn"
+          onClick={startGoogleLogin}
+          disabled={redirecting}
+        >
           <GoogleIcon />
           <span>Sign in with Google</span>
         </button>
+        {googleError && (
+          <p className="field-error google-error" role="alert">{googleError}</p>
+        )}
 
         <div className="divider"><span>or use a username</span></div>
 
@@ -339,9 +374,10 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
           </button>
         </form>
 
-        {googleStage && (
+        {/* Hand-off card shown while the browser is redirected to Google. */}
+        {redirecting && (
           <div className="gpopup-backdrop">
-            <div className="gpopup" role="dialog" aria-label="Sign in with Google (simulated)">
+            <div className="gpopup" role="dialog" aria-label="Redirecting to Google">
               <div className="gpopup-head">
                 <GoogleIcon size={26} />
                 <div>
@@ -349,29 +385,10 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
                   <small>to continue to {APP_NAME}</small>
                 </div>
               </div>
-
-              {googleStage === "choose" ? (
-                <>
-                  <p className="gpopup-title">Choose an account</p>
-                  <button className="gaccount" onClick={pickGoogleAccount}>
-                    <span className="gaccount-avatar">{initialOf(SIMULATED_GOOGLE_PROFILE.name)}</span>
-                    <span className="gaccount-text">
-                      <b>{SIMULATED_GOOGLE_PROFILE.name}</b>
-                      <small>{SIMULATED_GOOGLE_PROFILE.email}</small>
-                    </span>
-                  </button>
-                  <p className="gpopup-note">
-                    Simulated popup — no real Google account is used. See app/cloud.js to connect
-                    NextAuth.js or Supabase.
-                  </p>
-                  <button className="gpopup-cancel" onClick={() => setGoogleStage(null)}>Cancel</button>
-                </>
-              ) : (
-                <div className="gpopup-loading" role="status">
-                  <span className="spinner" />
-                  <p>Signing in…</p>
-                </div>
-              )}
+              <div className="gpopup-loading" role="status">
+                <span className="spinner" />
+                <p>Redirecting to Google…</p>
+              </div>
             </div>
           </div>
         )}
@@ -867,8 +884,11 @@ export default function Page() {
       if (saved) {
         if (saved.themeKey && THEMES[saved.themeKey]) setThemeKey(saved.themeKey);
         if (saved.guest) setGuest(saved.guest);
-        if (saved.accounts) setAccounts(saved.accounts);
-        if (saved.sessionId && saved.accounts?.[saved.sessionId]) setSessionId(saved.sessionId);
+        // Drop the fake account from the old simulated Google popup: it was never
+        // a real login, so it must not stay signed in or show up in the league.
+        const { [SIMULATED_ACCOUNT_ID]: _simulated, ...realAccounts } = saved.accounts ?? {};
+        setAccounts(realAccounts);
+        if (saved.sessionId && realAccounts[saved.sessionId]) setSessionId(saved.sessionId);
       } else {
         // First launch after the rename: carry over the old guest progress.
         const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) ?? "null");
@@ -887,6 +907,72 @@ export default function Page() {
     if (!hydrated) return;
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ themeKey, guest, accounts, sessionId }));
   }, [themeKey, guest, accounts, sessionId, hydrated]);
+
+  /* ---------------- Supabase auth listener ---------------- */
+  // Latest values for use inside the long-lived listener below.
+  const guestRef = useRef(guest);
+  const accountsRef = useRef(accounts);
+  guestRef.current = guest;
+  accountsRef.current = accounts;
+
+  useEffect(() => {
+    // Wait for localStorage to load so we know which accounts already exist.
+    if (!supabase || !hydrated) return;
+    let cancelled = false;
+
+    // Maps a Supabase session onto the app's user state (accounts + sessionId).
+    function applySession(session) {
+      if (!session?.user) {
+        // Signed out. Only drop a Google/Supabase login; a local username
+        // account has no Supabase session and must stay signed in.
+        setSessionId((prev) => (prev?.startsWith(GOOGLE_ID_PREFIX) ? null : prev));
+        return;
+      }
+
+      const email = session.user.email;
+      const fullName =
+        session.user.user_metadata?.full_name ?? // Google profile name
+        session.user.user_metadata?.name ??
+        email?.split("@")[0] ??
+        "Player";
+      const id = `${GOOGLE_ID_PREFIX}${(email ?? session.user.id).toLowerCase()}`;
+
+      if (accountsRef.current[id]) {
+        // Returning player: refresh name/email, keep their saved XP + streak.
+        setAccounts((prev) => ({
+          ...prev,
+          [id]: { ...prev[id], displayName: fullName, email },
+        }));
+      } else {
+        // First login: create the account, carrying over any guest progress.
+        setAccounts((prev) => ({
+          ...prev,
+          [id]: { id, displayName: fullName, email, provider: "google", profile: guestRef.current },
+        }));
+        setGuest(EMPTY_PROFILE);
+      }
+      setSessionId(id);
+      setAuthOpen(false);
+    }
+
+    // 1) Existing session on mount (also covers the return from Google).
+    supabase.auth.getSession().then(({ data }) => {
+      if (!cancelled) applySession(data.session);
+    });
+
+    // 2) Live changes: SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, ...
+    //    (Keep this callback synchronous: don't await Supabase calls inside it.)
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      applySession(session);
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, [hydrated]);
 
   /* ---------------- leave the boot screen ---------------- */
   useEffect(() => {
@@ -988,24 +1074,34 @@ export default function Page() {
     return { ok: true };
   }
 
-  // `googleProfile` = { name, email } as returned by signInWithGoogle().
-  function handleGoogleSuccess(googleProfile) {
-    const id = `google:${googleProfile.email.toLowerCase()}`;
-    if (accounts[id]) {
-      setSessionId(id);
-      setAuthOpen(false);
-    } else {
-      createAccountAndSignIn({
-        id,
-        displayName: googleProfile.name,
-        email: googleProfile.email,
+  // Real Google login. Sends the browser to Google; when Google sends the player
+  // back to `window.location.origin`, the auth listener above receives the session.
+  async function handleGoogleLogin() {
+    if (!supabase) {
+      return {
+        ok: false,
+        error: "Google login isn't configured. Add the Supabase keys to .env.local and restart.",
+      };
+    }
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
+        options: { redirectTo: window.location.origin },
       });
+      if (error) return { ok: false, error: error.message };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message ?? "Google sign-in failed. Please try again." };
     }
   }
 
-  function handleSignOut() {
-    setSessionId(null);
+  async function handleSignOut() {
+    try {
+      await supabase?.auth.signOut(); // ends the Supabase session (no-op if there is none)
+    } catch (err) {
+      console.warn("[OctoPi] Supabase sign-out failed:", err.message);
+    }
+    setSessionId(null); // also covers username accounts, which have no Supabase session
     setTab("learn");
     setScreen("home");
   }
@@ -1120,7 +1216,7 @@ export default function Page() {
               onClose={() => setAuthOpen(false)}
               onRegister={handleRegister}
               onLogin={handleLogin}
-              onGoogleSuccess={handleGoogleSuccess}
+              onGoogleLogin={handleGoogleLogin}
             />
           )}
         </div>
