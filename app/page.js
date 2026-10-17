@@ -1,22 +1,46 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { questions } from "./questions";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { questions as fallbackQuestions } from "./questions";
+import { parseQuestionsFromCSV } from "./sheet";
+import {
+  fetchFriendsLeague,
+  isUsernameTakenInCloud,
+  signInWithGoogle,
+  SIMULATED_GOOGLE_PROFILE,
+  syncProfileToCloud,
+} from "./cloud";
 
 /* ========================================================================
    CONSTANTS
    ======================================================================== */
 
+const APP_NAME = "OctoPi";
+
 const MAX_HEARTS = 3;
 const XP_PER_CORRECT = 10;
 const XP_PER_HEART_LEFT = 5;
 
-const STORAGE_KEY = "mathlingo-state-v1";
+const BOOT_MIN_MS = 2000; // the π logo is always shown for at least 2 seconds
+const BOOT_FADE_MS = 450; // fade-out of the boot screen
+const SHEET_TIMEOUT_MS = 8000; // give up on the sheet after this long
+
+// Normal "share" link of the question sheet (the one you copy from the browser).
+// The effect below converts it into a CSV download link automatically.
+// Share setting required: "Anyone with the link → Viewer".
+const GOOGLE_SHEET_URL =
+  "https://docs.google.com/spreadsheets/d/1rn6ysccCkrmNXV_47834nhGZHZSldwvSrKzyrhe9LRQ/edit?hl=id&gid=0#gid=0";
+
+const STORAGE_KEY = "octopi-state-v1";
+const LEGACY_STORAGE_KEY = "mathlingo-state-v1"; // pre-rename saves (guest progress only)
+
+const EMPTY_PROFILE = { xp: 0, streak: 0, lastActive: null };
+const USERNAME_RE = /^[A-Za-z0-9_.-]{3,16}$/;
 
 // Accent themes. Only the app chrome uses these; Pieter's image is never tinted.
 const THEMES = {
   green: {
-    label: "Duolingo Green",
+    label: "Pickle Green",
     accent: "#58cc02",
     dark: "#58a700",
     light: "#d7ffb8",
@@ -35,7 +59,7 @@ const THEMES = {
   },
 };
 
-// Decorative icon per topic. Unknown topics (e.g. from a future Google Sheet)
+// Decorative icon per topic. Unknown topics (anything new in the Google Sheet)
 // fall back to DEFAULT_ICONS, cycled by index.
 const TOPIC_ICONS = {
   "Inverse & Direct Proportions": "⚖️",
@@ -43,20 +67,6 @@ const TOPIC_ICONS = {
   "Standard Form & Non-Standard Form": "🔬",
 };
 const DEFAULT_ICONS = ["➕", "📐", "🧮", "📊", "🔢"];
-
-// Mock global players (the user is merged in dynamically).
-const MOCK_PLAYERS = [
-  { name: "Euler_Fan", xp: 520, streak: 41 },
-  { name: "PiLover3.14", xp: 465, streak: 28 },
-  { name: "AlgebraAce", xp: 410, streak: 19 },
-  { name: "Fractionator", xp: 355, streak: 12 },
-  { name: "SumSensei", xp: 300, streak: 9 },
-  { name: "NinjaNumbers", xp: 240, streak: 7 },
-  { name: "GeoGirl", xp: 185, streak: 5 },
-  { name: "ProofPanda", xp: 130, streak: 3 },
-  { name: "MathMango", xp: 85, streak: 2 },
-  { name: "ZeroToHero", xp: 45, streak: 1 },
-];
 
 /* ========================================================================
    HELPERS
@@ -77,16 +87,83 @@ function todayKey(offsetDays = 0) {
   return d.toLocaleDateString("en-CA"); // YYYY-MM-DD
 }
 
-function buildLeaderboard(profile) {
-  const you = {
-    name: "You",
-    xp: profile.xp,
-    streak: profile.streak,
-    isYou: true,
-  };
-  return [...MOCK_PLAYERS, you]
-    .sort((a, b) => b.xp - a.xp || (a.isYou ? 1 : -1))
+function initialOf(name) {
+  return (name?.trim()?.[0] ?? "?").toUpperCase();
+}
+
+/**
+ * Builds the ranked "Friends Ranking League".
+ *   friends – cloud friends  [{ id, name, xp, streak }]
+ *   others  – other accounts registered on this device (shown as friends too)
+ *   you     – the current player (signed-in user, or the guest)
+ */
+function buildLeague({ friends, others, you }) {
+  const rows = [
+    ...friends.map((f) => ({ id: f.id, name: f.name, xp: f.xp, streak: f.streak })),
+    ...others.map((a) => ({
+      id: a.id,
+      name: a.displayName,
+      xp: a.profile.xp,
+      streak: a.profile.streak,
+    })),
+    { ...you, isYou: true },
+  ];
+  return rows
+    .sort((a, b) => b.xp - a.xp || (a.isYou ? 1 : b.isYou ? -1 : 0))
     .map((p, i) => ({ ...p, rank: i + 1 }));
+}
+
+/* ========================================================================
+   MATH SYMBOL BACKGROUND + BOOT SCREEN
+   ======================================================================== */
+
+// Sits behind every screen. One SVG <pattern> tiles π ∑ √ ∫ ÷ × + forever.
+// The colour is `text-gray-200/40` expressed in plain CSS (see .math-bg in
+// globals.css) because this project doesn't use Tailwind.
+const MATH_TILE = [
+  ["π", 18, 34, -12],
+  ["∑", 78, 22, 8],
+  ["√", 138, 40, -6],
+  ["∫", 40, 96, 10],
+  ["÷", 100, 88, -10],
+  ["×", 150, 110, 6],
+  ["+", 20, 160, 0],
+  ["π", 82, 156, 12],
+  ["∑", 140, 168, -8],
+];
+
+function MathBackground() {
+  return (
+    <svg className="math-bg" aria-hidden="true" focusable="false">
+      <defs>
+        <pattern id="octopi-math" width="180" height="190" patternUnits="userSpaceOnUse">
+          {MATH_TILE.map(([ch, x, y, rot], i) => (
+            <text key={i} x={x} y={y} transform={`rotate(${rot} ${x} ${y})`}>
+              {ch}
+            </text>
+          ))}
+        </pattern>
+      </defs>
+      <rect width="100%" height="100%" fill="url(#octopi-math)" />
+    </svg>
+  );
+}
+
+function BootScreen({ leaving }) {
+  return (
+    <div
+      className={`boot ${leaving ? "leaving" : ""}`}
+      role="status"
+      aria-live="polite"
+      aria-label={`Loading ${APP_NAME}`}
+    >
+      <div className="boot-pi" aria-hidden="true">π</div>
+      <div className="boot-name">{APP_NAME}</div>
+      <div className="boot-dots" aria-hidden="true">
+        <span /><span /><span />
+      </div>
+    </div>
+  );
 }
 
 /* ========================================================================
@@ -139,15 +216,235 @@ function PieterSays({ children, size = 120 }) {
 }
 
 /* ========================================================================
+   AUTH UI: Google icon, account modal, avatar menu
+   ======================================================================== */
+
+// Official multi-colour Google "G" mark.
+function GoogleIcon({ size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+    </svg>
+  );
+}
+
+/**
+ * "Log-In / Register" dialog.
+ *   - Username tab: pick a unique username (no password in this local demo —
+ *     a real backend would add email/password, magic link or OAuth).
+ *   - "Sign in with Google": SIMULATED popup. To make it real, follow the
+ *     NextAuth.js / Supabase steps documented on `signInWithGoogle` in
+ *     app/cloud.js (that is the one place to paste your Google client ID).
+ */
+function AuthModal({ onClose, onRegister, onLogin, onGoogleSuccess }) {
+  const [mode, setMode] = useState("register"); // "register" | "login"
+  const [username, setUsername] = useState("");
+  const [error, setError] = useState("");
+  const [googleStage, setGoogleStage] = useState(null); // null | "choose" | "connecting"
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, [mode]);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key !== "Escape") return;
+      if (googleStage === "connecting") return;
+      if (googleStage === "choose") setGoogleStage(null);
+      else onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [googleStage, onClose]);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    const res = await (mode === "register" ? onRegister(username) : onLogin(username));
+    if (!res.ok) setError(res.error);
+  }
+
+  async function pickGoogleAccount() {
+    setGoogleStage("connecting");
+    try {
+      const profile = await signInWithGoogle();
+      onGoogleSuccess(profile); // closes the modal
+    } catch {
+      setError("Google sign-in failed. Please try again.");
+      setGoogleStage(null);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+        <button className="modal-close" onClick={onClose} aria-label="Close">✕</button>
+
+        <div className="modal-head">
+          <span className="logo-mark">π</span>
+          <h2 id="auth-title">Join {APP_NAME}</h2>
+          <p>Save your streak &amp; XP and climb your friends&apos; league.</p>
+        </div>
+
+        <button type="button" className="google-btn" onClick={() => setGoogleStage("choose")}>
+          <GoogleIcon />
+          <span>Sign in with Google</span>
+        </button>
+
+        <div className="divider"><span>or use a username</span></div>
+
+        <div className="auth-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={mode === "register"}
+            className={`auth-tab ${mode === "register" ? "active" : ""}`}
+            onClick={() => { setMode("register"); setError(""); }}
+          >
+            Register
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === "login"}
+            className={`auth-tab ${mode === "login" ? "active" : ""}`}
+            onClick={() => { setMode("login"); setError(""); }}
+          >
+            Log In
+          </button>
+        </div>
+
+        <form onSubmit={submit} className="auth-form" noValidate>
+          <label className="field">
+            <span className="field-label">
+              {mode === "register" ? "Choose a unique username" : "Your username"}
+            </span>
+            <input
+              ref={inputRef}
+              className="field-input"
+              value={username}
+              onChange={(e) => { setUsername(e.target.value); setError(""); }}
+              placeholder="e.g. PiPioneer"
+              maxLength={16}
+              autoComplete="username"
+              spellCheck={false}
+            />
+          </label>
+          <p className="field-hint">3–16 characters: letters, numbers, _ . -</p>
+          {error && <p className="field-error" role="alert">{error}</p>}
+          <button className="btn big" type="submit" disabled={!username.trim()}>
+            {mode === "register" ? "CREATE ACCOUNT" : "LOG IN"}
+          </button>
+        </form>
+
+        {googleStage && (
+          <div className="gpopup-backdrop">
+            <div className="gpopup" role="dialog" aria-label="Sign in with Google (simulated)">
+              <div className="gpopup-head">
+                <GoogleIcon size={26} />
+                <div>
+                  <b>Sign in with Google</b>
+                  <small>to continue to {APP_NAME}</small>
+                </div>
+              </div>
+
+              {googleStage === "choose" ? (
+                <>
+                  <p className="gpopup-title">Choose an account</p>
+                  <button className="gaccount" onClick={pickGoogleAccount}>
+                    <span className="gaccount-avatar">{initialOf(SIMULATED_GOOGLE_PROFILE.name)}</span>
+                    <span className="gaccount-text">
+                      <b>{SIMULATED_GOOGLE_PROFILE.name}</b>
+                      <small>{SIMULATED_GOOGLE_PROFILE.email}</small>
+                    </span>
+                  </button>
+                  <p className="gpopup-note">
+                    Simulated popup — no real Google account is used. See app/cloud.js to connect
+                    NextAuth.js or Supabase.
+                  </p>
+                  <button className="gpopup-cancel" onClick={() => setGoogleStage(null)}>Cancel</button>
+                </>
+              ) : (
+                <div className="gpopup-loading" role="status">
+                  <span className="spinner" />
+                  <p>Signing in…</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UserMenu({ user, onSignOut }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => ref.current && !ref.current.contains(e.target) && setOpen(false);
+    const onKey = (e) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="user-menu" ref={ref}>
+      <button
+        className="avatar-btn"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        title={user.displayName}
+      >
+        <span className="avatar">{initialOf(user.displayName)}</span>
+        <span className="avatar-name">{user.displayName}</span>
+        <span className="caret" aria-hidden="true">▾</span>
+      </button>
+
+      {open && (
+        <div className="dropdown" role="menu">
+          <div className="dropdown-head">
+            <span className="avatar big">{initialOf(user.displayName)}</span>
+            <div>
+              <b>{user.displayName}</b>
+              <small>{user.email ?? "Username account"}</small>
+            </div>
+          </div>
+          <button
+            className="dropdown-item"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onSignOut();
+            }}
+          >
+            ⎋ Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ========================================================================
    NAVBAR
    ======================================================================== */
 
-function Navbar({ themeKey, onThemeChange, profile, onLogoClick }) {
+function Navbar({ themeKey, onThemeChange, profile, user, onOpenAuth, onSignOut, onLogoClick }) {
   return (
     <header className="navbar">
-      <button className="logo" onClick={onLogoClick} aria-label="Go to home">
-        <span className="logo-mark">∑</span>
-        <span className="logo-text">mathlingo</span>
+      <button className="logo" onClick={onLogoClick} aria-label={`${APP_NAME} home`}>
+        <span className="logo-mark">π</span>
+        <span className="logo-text">{APP_NAME}</span>
       </button>
 
       <div className="nav-right">
@@ -173,26 +470,41 @@ function Navbar({ themeKey, onThemeChange, profile, onLogoClick }) {
             ))}
           </select>
         </label>
+
+        {user ? (
+          <UserMenu user={user} onSignOut={onSignOut} />
+        ) : (
+          <button className="auth-btn" onClick={onOpenAuth}>
+            Log-In / Register
+          </button>
+        )}
       </div>
     </header>
   );
 }
 
 /* ========================================================================
-   HOME: TOPICS + LEADERBOARD
+   HOME: TOPICS + LEAGUE
    ======================================================================== */
 
-function TopicCards({ topics, onSelect }) {
+function TopicCards({ topics, onSelect, source, total }) {
   return (
     <section>
       <PieterSays>
         <b>Hi, I&apos;m Pieter! 👋</b>
         <br />
-        Welcome to Mathlingo. Pick a topic and let&apos;s practise together —
+        Welcome to {APP_NAME}. Pick a topic and let&apos;s practise together —
         you&apos;ve got 3 hearts, so think carefully!
       </PieterSays>
 
-      <h1 className="section-title">What math topic are you struggling on?</h1>
+      <h1 className="section-title">What math topic are you struggling on today?</h1>
+
+      <p className={`sync-chip ${source}`}>
+        <span className="sync-dot" />
+        {source === "sheet"
+          ? `Live from Google Sheets · ${total} ${total === 1 ? "question" : "questions"}`
+          : `Offline question bank · ${total} ${total === 1 ? "question" : "questions"} (Google Sheet unavailable)`}
+      </p>
 
       <div className="topic-grid">
         {topics.map((t, i) => (
@@ -201,7 +513,9 @@ function TopicCards({ topics, onSelect }) {
               {TOPIC_ICONS[t.name] ?? DEFAULT_ICONS[i % DEFAULT_ICONS.length]}
             </span>
             <span className="topic-name">{t.name}</span>
-            <span className="topic-count">{t.count} questions</span>
+            <span className="topic-count">
+              {t.count} {t.count === 1 ? "question" : "questions"}
+            </span>
             <span className="topic-start">START</span>
           </button>
         ))}
@@ -212,25 +526,37 @@ function TopicCards({ topics, onSelect }) {
 
 const MEDALS = { 1: "🥇", 2: "🥈", 3: "🥉" };
 
-function Leaderboard({ profile }) {
-  const board = useMemo(() => buildLeaderboard(profile), [profile]);
-
+function Leaderboard({ league, user, onOpenAuth }) {
   return (
     <section>
-      <h1 className="section-title">Global Leaderboard</h1>
-      <p className="section-sub">Earn XP by finishing quizzes to climb the ranks.</p>
+      <h1 className="section-title">Friends Ranking League</h1>
+      <p className="section-sub">Earn XP by finishing quizzes to climb your friends&apos; ranks.</p>
+
+      {!user && (
+        <div className="league-cta">
+          <div>
+            <b>Playing as a guest</b>
+            <span>Log in to save your streak &amp; XP and appear under your own name.</span>
+          </div>
+          <button className="btn" onClick={onOpenAuth}>LOG-IN / REGISTER</button>
+        </div>
+      )}
 
       <ol className="board">
-        {board.map((p) => (
-          <li key={p.name} className={`board-row ${p.isYou ? "you" : ""} ${p.rank <= 3 ? "top" : ""}`}>
+        {league.map((p) => (
+          <li
+            key={p.id}
+            className={`board-row ${p.isYou ? "you" : ""} ${p.rank <= 3 ? "top" : ""}`}
+            aria-current={p.isYou ? "true" : undefined}
+          >
             <span className="board-rank">
               {MEDALS[p.rank] && <span className="medal">{MEDALS[p.rank]}</span>}
               #{p.rank}
             </span>
-            <span className="board-avatar">{p.name[0].toUpperCase()}</span>
+            <span className="board-avatar">{initialOf(p.name)}</span>
             <span className="board-name">
               {p.name}
-              {p.isYou && <em className="you-tag">YOU</em>}
+              {p.isYou && <em className="you-tag">{user ? "YOU" : "GUEST"}</em>}
             </span>
             <span className="board-streak">🔥 {p.streak}</span>
             <span className="board-xp">{p.xp} XP</span>
@@ -257,7 +583,7 @@ function Hearts({ count }) {
   );
 }
 
-function Quiz({ topic, onExit, onGameOver, onComplete }) {
+function Quiz({ topic, questions, onExit, onGameOver, onComplete }) {
   // Only questions from the chosen topic, in random order.
   const [queue] = useState(() => shuffle(questions.filter((q) => q.topic === topic)));
   const [index, setIndex] = useState(0);
@@ -424,14 +750,14 @@ function Complete({ info, earnedXp, rank, onHome, onLeaderboard }) {
             <span className="rs-value">❤️ {info.heartsLeft}</span>
           </div>
           <div className="result-stat rank">
-            <span className="rs-label">GLOBAL RANK</span>
+            <span className="rs-label">LEAGUE RANK</span>
             <span className="rs-value">#{rank}</span>
           </div>
         </div>
 
         <div className="end-actions">
           <button className="btn big" onClick={onHome}>CONTINUE</button>
-          <button className="btn ghost big" onClick={onLeaderboard}>VIEW LEADERBOARD</button>
+          <button className="btn ghost big" onClick={onLeaderboard}>VIEW LEAGUE</button>
         </div>
       </div>
     </div>
@@ -443,10 +769,25 @@ function Complete({ info, earnedXp, rank, onHome, onLeaderboard }) {
    ======================================================================== */
 
 export default function Page() {
+  /* ---- boot sequence: π logo ≥ 2s AND hydration + sheet download finished ---- */
+  const [bootMinDone, setBootMinDone] = useState(false);
+  const [bootPhase, setBootPhase] = useState("loading"); // "loading" | "leaving" | "done"
+
+  /* ---- question data ---- */
+  const [questions, setQuestions] = useState([]);
+  const [source, setSource] = useState("offline"); // "sheet" | "offline"
+  const [dataReady, setDataReady] = useState(false);
+
+  /* ---- persisted state ---- */
   const [themeKey, setThemeKey] = useState("green");
-  const [profile, setProfile] = useState({ xp: 0, streak: 0, lastActive: null });
+  const [guest, setGuest] = useState(EMPTY_PROFILE); // progress while logged out
+  const [accounts, setAccounts] = useState({}); // id -> { id, displayName, provider, email?, profile }
+  const [sessionId, setSessionId] = useState(null); // id of the logged-in account
   const [hydrated, setHydrated] = useState(false);
 
+  /* ---- ui state ---- */
+  const [friends, setFriends] = useState([]);
+  const [authOpen, setAuthOpen] = useState(false);
   const [tab, setTab] = useState("learn"); // "learn" | "leaderboard"
   const [screen, setScreen] = useState("home"); // "home" | "quiz" | "gameover" | "complete"
   const [topic, setTopic] = useState(null);
@@ -454,30 +795,150 @@ export default function Page() {
   const [endInfo, setEndInfo] = useState(null);
   const [earnedXp, setEarnedXp] = useState(0);
 
-  // Unique topics, in the order they appear in questions.js
-  const topics = useMemo(() => {
-    const map = new Map();
-    for (const q of questions) map.set(q.topic, (map.get(q.topic) ?? 0) + 1);
-    return [...map].map(([name, count]) => ({ name, count }));
+  // Derived auth state
+  const user = sessionId ? accounts[sessionId] ?? null : null;
+  const userName = user?.displayName ?? null;
+  const profile = user ? user.profile : guest;
+
+  /* ---------------- boot: minimum 2s timer ---------------- */
+  useEffect(() => {
+    const t = setTimeout(() => setBootMinDone(true), BOOT_MIN_MS);
+    return () => clearTimeout(t);
   }, []);
 
-  // Load saved state
+  /* ---------------- live Google Sheets sync ---------------- */
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SHEET_TIMEOUT_MS);
+
+    // ".../edit?hl=id&gid=0#gid=0"  →  ".../export?format=csv&gid=0"
+    // (everything from "/edit" onward is replaced; the tab id `gid` is kept)
+    const gid = GOOGLE_SHEET_URL.match(/gid=(\d+)/)?.[1] ?? "0";
+    const convertedUrl = GOOGLE_SHEET_URL.replace(/\/edit.*$/, `/export?format=csv&gid=${gid}`);
+
+    // Used only if the direct request is blocked (CORS / network).
+    const proxiedUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(convertedUrl)}`;
+
+    async function loadQuestions() {
+      let res;
+      try {
+        res = await fetch(convertedUrl, { signal: controller.signal, cache: "no-store" });
+        if (!res.ok) throw new Error(`Sheet request failed (${res.status})`);
+      } catch (err) {
+        if (controller.signal.aborted) throw err; // timed out / unmounted: don't retry
+        console.warn("[OctoPi] Direct sheet fetch failed, retrying through proxy:", err.message);
+        res = await fetch(proxiedUrl, { signal: controller.signal, cache: "no-store" });
+        if (!res.ok) throw new Error(`Proxy request failed (${res.status})`);
+      }
+      const rows = parseQuestionsFromCSV(await res.text());
+      if (rows.length === 0) throw new Error("Sheet contained no valid question rows");
+      return rows;
+    }
+
+    loadQuestions()
+      .then((rows) => {
+        if (cancelled) return;
+        setQuestions(rows);
+        setSource("sheet");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn("[OctoPi] Using bundled questions instead of the Google Sheet:", err.message);
+        setQuestions(fallbackQuestions);
+        setSource("offline");
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        if (!cancelled) setDataReady(true);
+      });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, []);
+
+  /* ---------------- load saved state ---------------- */
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
-      if (saved?.themeKey && THEMES[saved.themeKey]) setThemeKey(saved.themeKey);
-      if (saved?.profile) setProfile(saved.profile);
+      if (saved) {
+        if (saved.themeKey && THEMES[saved.themeKey]) setThemeKey(saved.themeKey);
+        if (saved.guest) setGuest(saved.guest);
+        if (saved.accounts) setAccounts(saved.accounts);
+        if (saved.sessionId && saved.accounts?.[saved.sessionId]) setSessionId(saved.sessionId);
+      } else {
+        // First launch after the rename: carry over the old guest progress.
+        const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) ?? "null");
+        if (legacy?.themeKey && THEMES[legacy.themeKey]) setThemeKey(legacy.themeKey);
+        if (legacy?.profile) setGuest(legacy.profile);
+      }
     } catch {
       /* ignore corrupted storage */
     }
     setHydrated(true);
   }, []);
 
-  // Save state
+  /* ---------------- save state (session + progress) ---------------- */
+  // NOTE: localStorage is not tamper-proof. See the security note in app/cloud.js.
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ themeKey, profile }));
-  }, [themeKey, profile, hydrated]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ themeKey, guest, accounts, sessionId }));
+  }, [themeKey, guest, accounts, sessionId, hydrated]);
+
+  /* ---------------- leave the boot screen ---------------- */
+  useEffect(() => {
+    if (bootPhase !== "loading" || !bootMinDone || !dataReady || !hydrated) return;
+    setBootPhase("leaving");
+  }, [bootPhase, bootMinDone, dataReady, hydrated]);
+
+  useEffect(() => {
+    if (bootPhase !== "leaving") return;
+    const t = setTimeout(() => setBootPhase("done"), BOOT_FADE_MS);
+    return () => clearTimeout(t);
+  }, [bootPhase]);
+
+  /* ---------------- friends league + cloud sync hooks ---------------- */
+  useEffect(() => {
+    let cancelled = false;
+    fetchFriendsLeague(sessionId).then((rows) => {
+      if (!cancelled) setFriends(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!hydrated || !sessionId) return;
+    syncProfileToCloud(sessionId, profile);
+  }, [hydrated, sessionId, profile]);
+
+  /* ---------------- derived data ---------------- */
+  // Unique topics, in the order they appear in the sheet.
+  const topics = useMemo(() => {
+    const map = new Map();
+    for (const q of questions) map.set(q.topic, (map.get(q.topic) ?? 0) + 1);
+    return [...map].map(([name, count]) => ({ name, count }));
+  }, [questions]);
+
+  const league = useMemo(
+    () =>
+      buildLeague({
+        friends,
+        others: Object.values(accounts).filter((a) => a.id !== sessionId),
+        you: {
+          id: sessionId ?? "guest",
+          name: userName ?? "You",
+          xp: profile.xp,
+          streak: profile.streak,
+        },
+      }),
+    [friends, accounts, sessionId, userName, profile]
+  );
+  const myRank = league.find((p) => p.isYou).rank;
 
   const theme = THEMES[themeKey];
   const themeVars = {
@@ -486,6 +947,70 @@ export default function Page() {
     "--accent-light": theme.light,
   };
 
+  /* ---------------- profile + auth actions ---------------- */
+  function updateProfile(next) {
+    if (user) {
+      setAccounts((a) => ({ ...a, [user.id]: { ...a[user.id], profile: next } }));
+    } else {
+      setGuest(next);
+    }
+  }
+
+  // Creates an account (carrying over any guest progress) and signs in.
+  function createAccountAndSignIn(account) {
+    setAccounts((a) => ({ ...a, [account.id]: { ...account, profile: guest } }));
+    setGuest(EMPTY_PROFILE);
+    setSessionId(account.id);
+    setAuthOpen(false);
+  }
+
+  async function handleRegister(rawName) {
+    const name = rawName.trim();
+    if (!USERNAME_RE.test(name)) {
+      return { ok: false, error: "Use 3–16 letters, numbers, _ . or -" };
+    }
+    const id = `user:${name.toLowerCase()}`;
+    if (accounts[id] || (await isUsernameTakenInCloud(name))) {
+      return { ok: false, error: `"${name}" is already taken. Try another username.` };
+    }
+    createAccountAndSignIn({ id, displayName: name, provider: "username" });
+    return { ok: true };
+  }
+
+  async function handleLogin(rawName) {
+    const name = rawName.trim();
+    const account = accounts[`user:${name.toLowerCase()}`];
+    if (!account) {
+      return { ok: false, error: `No account named "${name}" on this device. Register first.` };
+    }
+    setSessionId(account.id);
+    setAuthOpen(false);
+    return { ok: true };
+  }
+
+  // `googleProfile` = { name, email } as returned by signInWithGoogle().
+  function handleGoogleSuccess(googleProfile) {
+    const id = `google:${googleProfile.email.toLowerCase()}`;
+    if (accounts[id]) {
+      setSessionId(id);
+      setAuthOpen(false);
+    } else {
+      createAccountAndSignIn({
+        id,
+        displayName: googleProfile.name,
+        email: googleProfile.email,
+        provider: "google",
+      });
+    }
+  }
+
+  function handleSignOut() {
+    setSessionId(null);
+    setTab("learn");
+    setScreen("home");
+  }
+
+  /* ---------------- quiz flow ---------------- */
   function startQuiz(name) {
     setTopic(name);
     setQuizKey((k) => k + 1);
@@ -505,7 +1030,7 @@ export default function Page() {
     if (profile.lastActive === todayKey()) streak = Math.max(profile.streak, 1);
     else if (profile.lastActive === todayKey(-1)) streak = profile.streak + 1;
 
-    setProfile({ xp: profile.xp + earned, streak, lastActive: todayKey() });
+    updateProfile({ xp: profile.xp + earned, streak, lastActive: todayKey() });
     setEarnedXp(earned);
     setEndInfo(info);
     setScreen("complete");
@@ -516,68 +1041,92 @@ export default function Page() {
     setScreen("gameover");
   }
 
-  const myRank = useMemo(
-    () => buildLeaderboard(profile).find((p) => p.isYou).rank,
-    [profile]
-  );
+  /* ---------------- render ---------------- */
+  const booting = bootPhase !== "done";
 
   return (
     <div className="app" style={themeVars}>
-      {screen === "quiz" ? (
-        <Quiz
-          key={quizKey}
-          topic={topic}
-          onExit={() => goHome()}
-          onGameOver={handleGameOver}
-          onComplete={handleComplete}
-        />
-      ) : screen === "gameover" ? (
-        <GameOver info={endInfo} onRetry={() => startQuiz(topic)} onHome={() => goHome()} />
-      ) : screen === "complete" ? (
-        <Complete
-          info={endInfo}
-          earnedXp={earnedXp}
-          rank={myRank}
-          onHome={() => goHome()}
-          onLeaderboard={() => goHome("leaderboard")}
-        />
-      ) : (
-        <>
-          <Navbar
-            themeKey={themeKey}
-            onThemeChange={setThemeKey}
-            profile={profile}
-            onLogoClick={() => goHome()}
-          />
+      <MathBackground />
 
-          <main className="container">
-            <nav className="tabs" role="tablist">
-              <button
-                role="tab"
-                aria-selected={tab === "learn"}
-                className={`tab ${tab === "learn" ? "active" : ""}`}
-                onClick={() => setTab("learn")}
-              >
-                🏠 Learn
-              </button>
-              <button
-                role="tab"
-                aria-selected={tab === "leaderboard"}
-                className={`tab ${tab === "leaderboard" ? "active" : ""}`}
-                onClick={() => setTab("leaderboard")}
-              >
-                🏆 Global Leaderboard
-              </button>
-            </nav>
+      {bootPhase !== "loading" && (
+        <div className="app-content">
+          {screen === "quiz" ? (
+            <Quiz
+              key={quizKey}
+              topic={topic}
+              questions={questions}
+              onExit={() => goHome()}
+              onGameOver={handleGameOver}
+              onComplete={handleComplete}
+            />
+          ) : screen === "gameover" ? (
+            <GameOver info={endInfo} onRetry={() => startQuiz(topic)} onHome={() => goHome()} />
+          ) : screen === "complete" ? (
+            <Complete
+              info={endInfo}
+              earnedXp={earnedXp}
+              rank={myRank}
+              onHome={() => goHome()}
+              onLeaderboard={() => goHome("leaderboard")}
+            />
+          ) : (
+            <>
+              <Navbar
+                themeKey={themeKey}
+                onThemeChange={setThemeKey}
+                profile={profile}
+                user={user}
+                onOpenAuth={() => setAuthOpen(true)}
+                onSignOut={handleSignOut}
+                onLogoClick={() => goHome()}
+              />
 
-            {tab === "learn" ? (
-              <TopicCards topics={topics} onSelect={startQuiz} />
-            ) : (
-              <Leaderboard profile={profile} />
-            )}
-          </main>
-        </>
+              <main className="container">
+                <nav className="tabs" role="tablist">
+                  <button
+                    role="tab"
+                    aria-selected={tab === "learn"}
+                    className={`tab ${tab === "learn" ? "active" : ""}`}
+                    onClick={() => setTab("learn")}
+                  >
+                    🏠 Learn
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={tab === "leaderboard"}
+                    className={`tab ${tab === "leaderboard" ? "active" : ""}`}
+                    onClick={() => setTab("leaderboard")}
+                  >
+                    🏆 Friends Ranking League
+                  </button>
+                </nav>
+
+                {tab === "learn" ? (
+                  <TopicCards
+                    topics={topics}
+                    onSelect={startQuiz}
+                    source={source}
+                    total={questions.length}
+                  />
+                ) : (
+                  <Leaderboard league={league} user={user} onOpenAuth={() => setAuthOpen(true)} />
+                )}
+              </main>
+            </>
+          )}
+
+          {authOpen && (
+            <AuthModal
+              onClose={() => setAuthOpen(false)}
+              onRegister={handleRegister}
+              onLogin={handleLogin}
+              onGoogleSuccess={handleGoogleSuccess}
+            />
+          )}
+        </div>
       )}
+
+      {booting && <BootScreen leaving={bootPhase === "leaving"} />}
     </div>
   );
 }

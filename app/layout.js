@@ -7,7 +7,7 @@ const nunito = Nunito({
 });
 
 export const metadata = {
-  title: "Mathlingo – Learn math the fun way",
+  title: "OctoPi – Learn math the fun way",
   description: "A Duolingo-style web app for practising math topics with Pieter.",
 };
 
