@@ -27,7 +27,7 @@ import { fetchFriendsLeague, isUsernameTakenInCloud, syncProfileToCloud } from "
 
 // (If the env vars are missing the client is null: the app still works, and the
 // Google button shows a "not configured" message instead of crashing the page.)
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://supabase.co";
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://gdfqytvshswwpslthhba.supabase.co";
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "sb_publishable_eCMtd5iL9vCrExzUy-V_sw_hmwhCGWk";
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
