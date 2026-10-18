@@ -9,12 +9,10 @@ import { fetchFriendsLeague, isUsernameTakenInCloud, syncProfileToCloud } from "
 /* ========================================================================
    SUPABASE CLIENT (real Google OAuth)
 
-   Keys live in .env.local (never commit the file — it's git-ignored):
-     NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
-     NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon / publishable key>
-   The anon key is designed to be public; security comes from Row Level
-   Security policies on your tables, NOT from hiding this key. Restart
-   `npm run dev` after editing .env.local.
+   The project URL and publishable (anon) key are hardcoded below — nothing is
+   read from process.env / .env.local. The publishable key is designed to be
+   public; security comes from Row Level Security policies on your tables, NOT
+   from hiding this key. NEVER put the secret / service_role key in this file.
 
    One-time Supabase dashboard setup for Google login:
      1. Authentication → Providers → Google → enable, paste the Google
@@ -25,11 +23,8 @@ import { fetchFriendsLeague, isUsernameTakenInCloud, syncProfileToCloud } from "
           http://localhost:3000   (and your production URL)
    ======================================================================== */
 
-// (If the env vars are missing the client is null: the app still works, and the
-// Google button shows a "not configured" message instead of crashing the page.)
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://gdfqytvshswwpslthhba.supabase.co";
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "sb_publishable_eCMtd5iL9vCrExzUy-V_sw_hmwhCGWk";
-
+const supabaseUrl = "https://gdfqytvhdcfnstvvqieu.supabase.co";
+const supabaseAnonKey = "sb_publishable_eCMtd5iL9vCrExzUy-V_sw_hmwhCGWk";
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // Ids of accounts that came from a real Supabase (Google) session start with this.
@@ -914,7 +909,7 @@ export default function Page() {
 
   useEffect(() => {
     // Wait for localStorage to load so we know which accounts already exist.
-    if (!supabase || !hydrated) return;
+    if (!hydrated) return;
     let cancelled = false;
 
     // Maps a Supabase session onto the app's user state (accounts + sessionId).
@@ -1075,23 +1070,22 @@ export default function Page() {
   // back to `window.location.origin`, the auth listener above receives the session.
   async function handleGoogleLogin() {
     try {
-      // Force it to use our hardcoded client variable directly
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
-        options: { 
-          redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined 
+        options: {
+          redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
         },
       });
       if (error) return { ok: false, error: error.message };
       return { ok: true };
     } catch (err) {
-      return { ok: false, error: err.message ?? "Google sign-in failed. Please try again." };
+      return { ok: false, error: err.message };
     }
   }
 
   async function handleSignOut() {
     try {
-      await supabase?.auth.signOut(); // ends the Supabase session (no-op if there is none)
+      await supabase.auth.signOut(); // ends the Supabase session (no-op if there is none)
     } catch (err) {
       console.warn("[OctoPi] Supabase sign-out failed:", err.message);
     }
