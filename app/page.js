@@ -1077,13 +1077,8 @@ export default function Page() {
   // Real Google login. Sends the browser to Google; when Google sends the player
   // back to `window.location.origin`, the auth listener above receives the session.
   async function handleGoogleLogin() {
-    if (!supabase) {
-      return {
-        ok: false,
-        error: "Google login isn't configured. Add the Supabase keys to .env.local and restart.",
-      };
-    }
     try {
+      // Force it to use our hardcoded client variable directly
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
         options: { 
