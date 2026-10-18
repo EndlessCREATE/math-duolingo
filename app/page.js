@@ -1086,7 +1086,9 @@ export default function Page() {
     try {
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
-        options: { redirectTo: window.location.origin },
+        options: { 
+          redirectTo: typeof window !== 'undefined' ? window.location.origin : undefined 
+        },
       });
       if (error) return { ok: false, error: error.message };
       return { ok: true };
