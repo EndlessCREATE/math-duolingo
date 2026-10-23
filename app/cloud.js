@@ -1,116 +1,167 @@
 // ---------------------------------------------------------------------------
-// CLOUD / AUTH PLACEHOLDERS
+// CLOUD DATA LAYER (Supabase)
 //
-// Everything in this file is a LOCAL STAND-IN for a real backend. Each function
-// documents where to plug in a real service. page.js only talks to the cloud
-// through these functions, so swapping them out is the only change needed.
+// Everything player-related lives in the Supabase database:
+//   • auth.users        – credentials / Google identities   (managed by Supabase Auth)
+//   • public.profiles   – username, xp, streak, last_active (one row per player)
 //
-// IMPORTANT (security): the browser's localStorage is NOT secure storage. Any
-// player can open dev-tools and edit their XP/streak. For leaderboards that
-// can't be cheated, XP must be awarded SERVER-SIDE (e.g. a Supabase Edge
-// Function / Firebase Cloud Function / Next.js route handler that checks the
-// quiz answers) and protected with row-level security so a user can only
-// write their own row.
+// There are NO local fallback arrays or mock players any more. Streaks, XP and
+// ranks come from `profiles`, so a learner sees the same numbers on every device,
+// and the league updates live through Supabase Realtime.
+//
+// One-time setup: run  supabase/schema.sql  in the Supabase SQL editor.
+// (It creates the table, row-level-security policies, the award_xp() function,
+// the new-user trigger and switches Realtime on for the table.)
+//
+// Every function takes the Supabase client as its first argument. The client is
+// created once in app/page.js.
 // ---------------------------------------------------------------------------
 
 /* ========================================================================
-   FRIENDS DATA (mock)
+   USERNAME  <->  VIRTUAL EMAIL
    ======================================================================== */
 
-const MOCK_FRIENDS = [
-  { id: "mock:euler", name: "Euler_Fan", xp: 520, streak: 41 },
-  { id: "mock:pi", name: "PiLover3.14", xp: 465, streak: 28 },
-  { id: "mock:algebra", name: "AlgebraAce", xp: 410, streak: 19 },
-  { id: "mock:fraction", name: "Fractionator", xp: 355, streak: 12 },
-  { id: "mock:sum", name: "SumSensei", xp: 300, streak: 9 },
-  { id: "mock:ninja", name: "NinjaNumbers", xp: 240, streak: 7 },
-  { id: "mock:geo", name: "GeoGirl", xp: 185, streak: 5 },
-  { id: "mock:panda", name: "ProofPanda", xp: 130, streak: 3 },
-  { id: "mock:mango", name: "MathMango", xp: 85, streak: 2 },
-  { id: "mock:zero", name: "ZeroToHero", xp: 45, streak: 1 },
-];
+// Supabase Auth logs in with an email. Players only choose a username, so it is
+// mapped to a virtual address that is never emailed.
+export const USER_EMAIL_DOMAIN = "octopi.edu";
+export const USERNAME_RE = /^[A-Za-z0-9_-]{3,16}$/;
+export const MIN_PASSWORD = 6; // Supabase's default minimum
 
-/* ========================================================================
-   USERNAMES
-   ======================================================================== */
+export function usernameToEmail(username) {
+  return `${username.trim().toLowerCase()}@${USER_EMAIL_DOMAIN}`;
+}
 
-/**
- * Is this username already used by someone in the cloud?
- *
- * TODO (Supabase):
- *   const { data } = await supabase
- *     .from("profiles").select("id").ilike("username", username).maybeSingle();
- *   return !!data;
- *   // + a UNIQUE index on lower(username) so races can't create duplicates.
- *
- * TODO (Firebase): query a `usernames/{lowercaseName}` document, or reserve
- * it in a transaction when registering.
- */
-export async function isUsernameTakenInCloud(username) {
-  const wanted = username.trim().toLowerCase();
-  return MOCK_FRIENDS.some((f) => f.name.toLowerCase() === wanted);
+export function isVirtualEmail(email) {
+  return !!email && email.toLowerCase().endsWith(`@${USER_EMAIL_DOMAIN}`);
+}
+
+/** Best display name for any kind of auth user (password or Google). */
+export function nameFromAuthUser(authUser) {
+  const meta = authUser?.user_metadata ?? {};
+  return (
+    meta.username ??
+    meta.full_name ?? // Google profile name
+    meta.name ??
+    authUser?.email?.split("@")[0] ??
+    "Player"
+  );
 }
 
 /* ========================================================================
-   GOOGLE SIGN-IN  ->  now LIVE in app/page.js (Supabase OAuth)
+   ERRORS
    ======================================================================== */
 
-// The simulated popup was removed. Real Google login lives in page.js:
-//   handleGoogleLogin()  -> supabase.auth.signInWithOAuth({ provider: "google" })
-//   auth listener effect -> supabase.auth.getSession() + onAuthStateChange()
-//   handleSignOut()      -> supabase.auth.signOut()
-// Dashboard setup (Google provider, redirect URLs) is documented at the top of
-// page.js, next to the createClient() call.
-//
-// Prefer NextAuth.js instead? `npm i next-auth`, add GoogleProvider in
-// app/api/auth/[...nextauth]/route.js (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET),
-// then use signIn("google") / useSession() / signOut() from "next-auth/react".
+export const CONFIRM_EMAIL_HELP =
+  "Your account was created, but Supabase is still asking for email confirmation (which virtual @octopi.edu addresses can never receive). " +
+  "In the Supabase dashboard open Authentication → Sign In / Providers → Email and turn OFF “Confirm email”, then log in.";
+
+/** True when the profiles table / award_xp function haven't been created yet. */
+export function isMissingSchema(error) {
+  const code = error?.code ?? "";
+  const msg = error?.message ?? "";
+  return (
+    ["PGRST205", "PGRST202", "42P01", "42883"].includes(code) ||
+    /schema cache|does not exist|could not find the (table|function)/i.test(msg)
+  );
+}
+
+/** Friendly text for the errors Supabase Auth can return. */
+export function describeAuthError(error) {
+  const code = error?.code ?? "";
+  const msg = (error?.message ?? "").toLowerCase();
+  if (code === "email_not_confirmed" || msg.includes("email not confirmed")) return CONFIRM_EMAIL_HELP;
+  if (code === "invalid_credentials" || msg.includes("invalid login credentials")) return "Wrong username or password.";
+  if (code === "user_already_exists" || msg.includes("already registered") || msg.includes("already been registered"))
+    return "That username is already taken. Try another one.";
+  if (code === "weak_password" || msg.includes("password should be") || msg.includes("password is too"))
+    return `Password must be at least ${MIN_PASSWORD} characters.`;
+  if (code === "over_request_rate_limit" || code === "over_email_send_rate_limit" || msg.includes("rate limit"))
+    return "Too many attempts. Please wait a minute and try again.";
+  if (code === "signup_disabled") return "Sign-ups are turned off for this project.";
+  if (msg.includes("failed to fetch") || msg.includes("network")) return "Can't reach the server. Check your connection and try again.";
+  return error?.message || "Something went wrong. Please try again.";
+}
 
 /* ========================================================================
-   FRIENDS LEAGUE (multi-tenant data)
+   PROFILES (read / create)
    ======================================================================== */
 
-/**
- * Load the friends that appear in the signed-in user's league.
- *
- * TODO (Supabase):
- *   // tables: profiles(id, username, xp, streak) and
- *   //         friendships(user_id, friend_id, status)
- *   const { data } = await supabase
- *     .from("friendships")
- *     .select("friend:profiles!friend_id(id, username, xp, streak)")
- *     .eq("user_id", userId).eq("status", "accepted");
- *   return data.map(({ friend }) => ({ id: friend.id, name: friend.username,
- *                                      xp: friend.xp, streak: friend.streak }));
- *   // Turn on Realtime for `profiles` to live-update the leaderboard.
- *
- * TODO (Firebase):
- *   // collection `users`, each doc has `friends: [uid, ...]`
- *   const snap = await getDocs(query(collection(db, "users"),
- *                                    where(documentId(), "in", friendUids)));
- *   return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
- *
- * @param {string|null} userId  the signed-in user's id (null for guests)
- * @returns {Promise<{id:string,name:string,xp:number,streak:number}[]>}
- */
-// eslint-disable-next-line no-unused-vars
-export async function fetchFriendsLeague(userId) {
-  return MOCK_FRIENDS;
+const PROFILE_COLUMNS = "id, username, xp, streak, last_active";
+
+/** Top players, highest XP first. */
+export async function fetchPlayers(client, limit = 200) {
+  const { data, error } = await client
+    .from("profiles")
+    .select(PROFILE_COLUMNS)
+    .order("xp", { ascending: false })
+    .order("username", { ascending: true })
+    .limit(limit);
+  return { rows: data ?? [], error };
 }
 
 /**
- * Save a user's streak + XP to the cloud (called after every change).
- *
- * TODO (Supabase):
- *   // Do NOT trust XP sent from the client. Call an RPC / Edge Function that
- *   // validates the completed quiz and increments XP itself:
- *   await supabase.rpc("award_xp", { quiz_id, answers });
- *   // RLS policy: using (auth.uid() = id) with check (auth.uid() = id)
- *
- * TODO (Firebase): write via a callable Cloud Function and lock the `users`
- * collection with Security Rules (allow write: if false from the client).
+ * Make sure the signed-in user has a profile row.
+ * The database trigger normally creates it at sign-up; this is the safety net
+ * (e.g. accounts that existed before the trigger was installed).
  */
-// eslint-disable-next-line no-unused-vars
-export async function syncProfileToCloud(userId, profile) {
-  /* no-op while running locally */
+export async function ensureProfile(client, authUser) {
+  const existing = await client.from("profiles").select(PROFILE_COLUMNS).eq("id", authUser.id).maybeSingle();
+  if (existing.error) return { row: null, error: existing.error };
+  if (existing.data) return { row: existing.data, error: null };
+
+  const base = String(nameFromAuthUser(authUser)).replace(/[^A-Za-z0-9_ .-]/g, "").slice(0, 20) || "player";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const username = attempt === 0 ? base : `${base}${Math.floor(Math.random() * 9000) + 1000}`;
+    const { data, error } = await client.from("profiles").insert({ id: authUser.id, username }).select(PROFILE_COLUMNS).single();
+    if (!error) return { row: data, error: null };
+    if (error.code === "23505") {
+      // unique violation: either the id (row appeared meanwhile) or the username
+      const again = await client.from("profiles").select(PROFILE_COLUMNS).eq("id", authUser.id).maybeSingle();
+      if (again.data) return { row: again.data, error: null };
+      continue; // username taken -> try a suffixed one
+    }
+    return { row: null, error };
+  }
+  return { row: null, error: { message: "Could not create a unique username." } };
+}
+
+/* ========================================================================
+   XP + STREAK (server-side)
+   ======================================================================== */
+
+/**
+ * Award XP for a finished quiz. The `award_xp` SQL function (schema.sql) runs on
+ * the server: it caps the amount, updates the streak from the server's date and
+ * returns the new profile row. Clients cannot UPDATE xp/streak directly.
+ *
+ * NOTE: the amount is still reported by the client, so a determined player could
+ * send a fake (capped) value. Fully cheat-proof XP needs the server to grade the
+ * answers itself (e.g. a Supabase Edge Function that holds the questions).
+ */
+export async function awardXp(client, amount) {
+  const { data, error } = await client.rpc("award_xp", { p_xp: Math.max(0, Math.round(amount)) });
+  return { row: data ?? null, error };
+}
+
+/* ========================================================================
+   REALTIME
+   ======================================================================== */
+
+/**
+ * Continuously listen to the profiles table (Supabase Realtime / postgres_changes).
+ * `onChange({ type: "UPSERT" | "DELETE", row })` fires for every insert, update or
+ * delete made by anyone — including the same player on another device.
+ * Returns an unsubscribe function.
+ */
+export function subscribeToProfiles(client, onChange) {
+  const channel = client
+    .channel(`octopi-profiles-${Math.random().toString(36).slice(2)}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "profiles" }, (payload) => {
+      if (payload.eventType === "DELETE") onChange({ type: "DELETE", row: payload.old });
+      else onChange({ type: "UPSERT", row: payload.new });
+    })
+    .subscribe();
+  return () => {
+    client.removeChannel(channel);
+  };
 }

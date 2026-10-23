@@ -1,36 +1,59 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { questions as fallbackQuestions } from "./questions";
 import { parseQuestionsFromCSV } from "./sheet";
-import { fetchFriendsLeague, isUsernameTakenInCloud, syncProfileToCloud } from "./cloud";
+import {
+  GROUP_NUMBERS,
+  GROUP_SHAPES,
+  GROUP_SHEET,
+  SESSION_SIZE,
+  TOPIC_DEFS,
+  buildMixedSession,
+  buildTopicSession,
+  topicDefFor,
+} from "./generators";
+import {
+  MIN_PASSWORD,
+  USERNAME_RE,
+  awardXp,
+  describeAuthError,
+  ensureProfile,
+  fetchPlayers,
+  isMissingSchema,
+  isVirtualEmail,
+  nameFromAuthUser,
+  subscribeToProfiles,
+  usernameToEmail,
+} from "./cloud";
+import { Pieter, PieterSays } from "./pieter";
+import { TopicIcon, iconKindForSheetTopic } from "./icons";
+import { MILESTONE_EVERY, milestoneMessage, trailingStreak } from "./milestones";
 
 /* ========================================================================
-   SUPABASE CLIENT (real Google OAuth)
+   SUPABASE CLIENT (real auth + database)
 
    The project URL and publishable (anon) key are hardcoded below — nothing is
    read from process.env / .env.local. The publishable key is designed to be
-   public; security comes from Row Level Security policies on your tables, NOT
-   from hiding this key. NEVER put the secret / service_role key in this file.
+   public; security comes from Row Level Security policies on your tables
+   (see supabase/schema.sql), NOT from hiding this key. NEVER put the secret /
+   service_role key in this file.
 
-   One-time Supabase dashboard setup for Google login:
-     1. Authentication → Providers → Google → enable, paste the Google
-        OAuth Client ID + Secret (Google Cloud Console → Credentials).
-     2. In Google Cloud Console add this "Authorized redirect URI":
+   Dashboard setup (one time):
+     1. SQL Editor → run supabase/schema.sql (profiles table, RLS, award_xp()).
+     2. Authentication → Providers → Email → turn OFF "Confirm email"
+        (username accounts use virtual @octopi.edu addresses that can't receive mail).
+     3. Authentication → Providers → Google → enable + paste the Google OAuth
+        Client ID / Secret. In Google Cloud Console add this redirect URI:
           https://<project-ref>.supabase.co/auth/v1/callback
-     3. Authentication → URL Configuration → add your site to "Redirect URLs":
+     4. Authentication → URL Configuration → Redirect URLs → add
           http://localhost:3000   (and your production URL)
    ======================================================================== */
 
 const supabaseUrl = "https://gdfqytvhdcfnstvvqieu.supabase.co";
 const supabaseAnonKey = "sb_publishable_eCMtd5iL9vCrExzUy-V_sw_hmwhCGWk";
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
-// Ids of accounts that came from a real Supabase (Google) session start with this.
-const GOOGLE_ID_PREFIX = "google:";
-// Fake account created by the old simulated popup; purged on load (see below).
-const SIMULATED_ACCOUNT_ID = "google:alex.morgan@example.com";
 
 /* ========================================================================
    CONSTANTS
@@ -41,10 +64,14 @@ const APP_NAME = "OctoPi";
 const MAX_HEARTS = 3;
 const XP_PER_CORRECT = 10;
 const XP_PER_HEART_LEFT = 5;
+// A round is capped at SESSION_SIZE questions, so one round is worth at most
+// 10 x 10 + 3 x 5 = 115 XP. award_xp() in schema.sql accepts up to 150 per call.
 
 const BOOT_MIN_MS = 2000; // the π logo is always shown for at least 2 seconds
 const BOOT_FADE_MS = 450; // fade-out of the boot screen
 const SHEET_TIMEOUT_MS = 8000; // give up on the sheet after this long
+const AUTH_TIMEOUT_MS = 6000; // never let the boot screen wait longer than this for auth
+const MILESTONE_MS = 9000; // how long Pieter's milestone bubble stays up
 
 // Normal "share" link of the question sheet (the one you copy from the browser).
 // The effect below converts it into a CSV download link automatically.
@@ -52,55 +79,22 @@ const SHEET_TIMEOUT_MS = 8000; // give up on the sheet after this long
 const GOOGLE_SHEET_URL =
   "https://docs.google.com/spreadsheets/d/1rn6ysccCkrmNXV_47834nhGZHZSldwvSrKzyrhe9LRQ/edit?hl=id&gid=0#gid=0";
 
-const STORAGE_KEY = "octopi-state-v1";
-const LEGACY_STORAGE_KEY = "mathlingo-state-v1"; // pre-rename saves (guest progress only)
+const STORAGE_KEY = "octopi-state-v1"; // guest progress only (signed-in data lives in Supabase)
+const LEGACY_STORAGE_KEY = "mathlingo-state-v1";
+const THEME_KEY = "octopi-theme"; // must match the inline script in layout.js
 
 const EMPTY_PROFILE = { xp: 0, streak: 0, lastActive: null };
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,16}$/;
 
-// Accent themes. Only the app chrome uses these; Pieter's image is never tinted.
-const THEMES = {
-  green: {
-    label: "Pickle Green",
-    accent: "#58cc02",
-    dark: "#58a700",
-    light: "#d7ffb8",
-  },
-  blue: {
-    label: "Ocean Blue",
-    accent: "#1cb0f6",
-    dark: "#1899d6",
-    light: "#ddf4ff",
-  },
-  purple: {
-    label: "Amethyst Purple",
-    accent: "#ce82ff",
-    dark: "#a568cc",
-    light: "#f3e0ff",
-  },
+// Accent colours (the actual values live in globals.css, per mode).
+const ACCENTS = {
+  green: "Pickle Green",
+  blue: "Ocean Blue",
+  purple: "Amethyst Purple",
 };
-
-// Decorative icon per topic. Unknown topics (anything new in the Google Sheet)
-// fall back to DEFAULT_ICONS, cycled by index.
-const TOPIC_ICONS = {
-  "Inverse & Direct Proportions": "⚖️",
-  "Rational & Irrational numbers": "π",
-  "Standard Form & Non-Standard Form": "🔬",
-};
-const DEFAULT_ICONS = ["➕", "📐", "🧮", "📊", "🔢"];
 
 /* ========================================================================
    HELPERS
    ======================================================================== */
-
-function shuffle(arr) {
-  const copy = [...arr];
-  for (let i = copy.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
 
 function todayKey(offsetDays = 0) {
   const d = new Date();
@@ -112,26 +106,21 @@ function initialOf(name) {
   return (name?.trim()?.[0] ?? "?").toUpperCase();
 }
 
-/**
- * Builds the ranked "Friends Ranking League".
- *   friends – cloud friends  [{ id, name, xp, streak }]
- *   others  – other accounts registered on this device (shown as friends too)
- *   you     – the current player (signed-in user, or the guest)
- */
-function buildLeague({ friends, others, you }) {
-  const rows = [
-    ...friends.map((f) => ({ id: f.id, name: f.name, xp: f.xp, streak: f.streak })),
-    ...others.map((a) => ({
-      id: a.id,
-      name: a.displayName,
-      xp: a.profile.xp,
-      streak: a.profile.streak,
-    })),
-    { ...you, isYou: true },
-  ];
-  return rows
-    .sort((a, b) => b.xp - a.xp || (a.isYou ? 1 : b.isYou ? -1 : 0))
-    .map((p, i) => ({ ...p, rank: i + 1 }));
+function applyTheme(mode, accent) {
+  const root = document.documentElement;
+  root.setAttribute("data-mode", mode);
+  root.setAttribute("data-accent", accent);
+  try {
+    localStorage.setItem(THEME_KEY, JSON.stringify({ mode, accent }));
+  } catch {
+    /* storage unavailable (private mode): the theme just won't persist */
+  }
+}
+
+function cloudStatusFrom(error) {
+  return isMissingSchema(error)
+    ? { status: "setup" }
+    : { status: "error", message: error?.message ?? "Unknown error" };
 }
 
 /* ========================================================================
@@ -139,8 +128,7 @@ function buildLeague({ friends, others, you }) {
    ======================================================================== */
 
 // Sits behind every screen. One SVG <pattern> tiles π ∑ √ ∫ ÷ × + forever.
-// The colour is `text-gray-200/40` expressed in plain CSS (see .math-bg in
-// globals.css) because this project doesn't use Tailwind.
+// Colours (light + dark) are set in globals.css (.math-bg text).
 const MATH_TILE = [
   ["π", 18, 34, -12],
   ["∑", 78, 22, 8],
@@ -188,55 +176,6 @@ function BootScreen({ leaving }) {
 }
 
 /* ========================================================================
-   PIETER (mascot) — never themed
-   ======================================================================== */
-
-function PieterFallback() {
-  // Shown only if /pieter.png is missing. Fixed colors, ignores the theme.
-  return (
-    <svg viewBox="0 0 120 120" className="pieter-img" role="img" aria-label="Pieter placeholder">
-      <circle cx="60" cy="64" r="44" fill="#ffc800" />
-      <circle cx="44" cy="54" r="12" fill="#fff" />
-      <circle cx="76" cy="54" r="12" fill="#fff" />
-      <circle cx="46" cy="56" r="5" fill="#3c3c3c" />
-      <circle cx="74" cy="56" r="5" fill="#3c3c3c" />
-      <path d="M44 80 Q60 94 76 80" stroke="#3c3c3c" strokeWidth="5" fill="none" strokeLinecap="round" />
-      <text x="60" y="30" textAnchor="middle" fontSize="20" fontWeight="900" fill="#3c3c3c">
-        π
-      </text>
-    </svg>
-  );
-}
-
-function Pieter({ size = 120 }) {
-  const [failed, setFailed] = useState(false);
-  return (
-    <div className="pieter" style={{ width: size, height: size }}>
-      {failed ? (
-        <PieterFallback />
-      ) : (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src="/pieter.png"
-          alt="Pieter, your math mascot"
-          className="pieter-img"
-          onError={() => setFailed(true)}
-        />
-      )}
-    </div>
-  );
-}
-
-function PieterSays({ children, size = 120 }) {
-  return (
-    <div className="pieter-row">
-      <Pieter size={size} />
-      <div className="bubble">{children}</div>
-    </div>
-  );
-}
-
-/* ========================================================================
    AUTH UI: Google icon, account modal, avatar menu
    ======================================================================== */
 
@@ -253,16 +192,19 @@ function GoogleIcon({ size = 20 }) {
 }
 
 /**
- * "Log-In / Register" dialog.
- *   - Username tab: pick a unique username (no password in this local demo —
- *     a real backend would add email/password, magic link or OAuth).
- *   - "Sign in with Google": REAL Supabase OAuth. `onGoogleLogin` (handleGoogleLogin
- *     in <Page/>) calls supabase.auth.signInWithOAuth, which redirects the browser
- *     to Google; on return the auth listener in <Page/> picks up the session.
+ * "Log-In / Register" dialog (real Supabase auth).
+ *   - Username + password: Supabase email/password auth on a virtual address
+ *     (`<username>@octopi.edu`). `onRegister` / `onLogin` live in <Page/>.
+ *   - "Sign in with Google": Supabase OAuth. `onGoogleLogin` (handleGoogleLogin
+ *     in <Page/>) redirects the browser to Google; on return the auth listener
+ *     in <Page/> picks up the session.
  */
 function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
   const [mode, setMode] = useState("register"); // "register" | "login"
   const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [googleError, setGoogleError] = useState("");
   const [redirecting, setRedirecting] = useState(false); // true while handing off to Google
@@ -283,9 +225,13 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
 
   async function submit(e) {
     e.preventDefault();
+    if (busy) return;
     setError("");
-    const res = await (mode === "register" ? onRegister(username) : onLogin(username));
+    setBusy(true);
+    const res = await (mode === "register" ? onRegister(username, password) : onLogin(username, password));
+    setBusy(false);
     if (!res.ok) setError(res.error);
+    // on success the auth listener in <Page/> closes this dialog
   }
 
   async function startGoogleLogin() {
@@ -298,6 +244,8 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
     }
   }
 
+  const canSubmit = username.trim().length > 0 && password.length > 0 && !busy;
+
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
@@ -306,21 +254,14 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
         <div className="modal-head">
           <span className="logo-mark">π</span>
           <h2 id="auth-title">Join {APP_NAME}</h2>
-          <p>Save your streak &amp; XP and climb your friends&apos; league.</p>
+          <p>Save your streak &amp; XP and climb the league on every device.</p>
         </div>
 
-        <button
-          type="button"
-          className="google-btn"
-          onClick={startGoogleLogin}
-          disabled={redirecting}
-        >
+        <button type="button" className="google-btn" onClick={startGoogleLogin} disabled={redirecting}>
           <GoogleIcon />
           <span>Sign in with Google</span>
         </button>
-        {googleError && (
-          <p className="field-error google-error" role="alert">{googleError}</p>
-        )}
+        {googleError && <p className="field-error google-error" role="alert">{googleError}</p>}
 
         <div className="divider"><span>or use a username</span></div>
 
@@ -356,13 +297,39 @@ function AuthModal({ onClose, onRegister, onLogin, onGoogleLogin }) {
               placeholder="e.g. PiPioneer"
               maxLength={16}
               autoComplete="username"
+              autoCapitalize="none"
               spellCheck={false}
             />
           </label>
-          <p className="field-hint">3–16 characters: letters, numbers, _ . -</p>
+
+          <label className="field">
+            <span className="field-label">Password</span>
+            <span className="pw-wrap">
+              <input
+                className="field-input"
+                type={showPw ? "text" : "password"}
+                value={password}
+                onChange={(e) => { setPassword(e.target.value); setError(""); }}
+                placeholder={mode === "register" ? `At least ${MIN_PASSWORD} characters` : "Your password"}
+                autoComplete={mode === "register" ? "new-password" : "current-password"}
+              />
+              <button
+                type="button"
+                className="pw-toggle"
+                onClick={() => setShowPw((s) => !s)}
+                aria-label={showPw ? "Hide password" : "Show password"}
+              >
+                {showPw ? "HIDE" : "SHOW"}
+              </button>
+            </span>
+          </label>
+
+          {mode === "register" && (
+            <p className="field-hint">Username: 3–16 letters, numbers, _ or -. No email needed.</p>
+          )}
           {error && <p className="field-error" role="alert">{error}</p>}
-          <button className="btn big" type="submit" disabled={!username.trim()}>
-            {mode === "register" ? "CREATE ACCOUNT" : "LOG IN"}
+          <button className="btn big" type="submit" disabled={!canSubmit}>
+            {busy ? "PLEASE WAIT…" : mode === "register" ? "CREATE ACCOUNT" : "LOG IN"}
           </button>
         </form>
 
@@ -448,7 +415,8 @@ function UserMenu({ user, onSignOut }) {
    NAVBAR
    ======================================================================== */
 
-function Navbar({ themeKey, onThemeChange, profile, user, onOpenAuth, onSignOut, onLogoClick }) {
+function Navbar({ mode, onToggleMode, accent, onAccentChange, profile, user, onOpenAuth, onSignOut, onLogoClick }) {
+  const dark = mode === "dark";
   return (
     <header className="navbar">
       <button className="logo" onClick={onLogoClick} aria-label={`${APP_NAME} home`}>
@@ -464,17 +432,23 @@ function Navbar({ themeKey, onThemeChange, profile, user, onOpenAuth, onSignOut,
           ⚡ <b>{profile.xp}</b>
         </div>
 
+        <button
+          className="mode-toggle"
+          onClick={onToggleMode}
+          aria-pressed={dark}
+          aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+          title={dark ? "Light mode" : "Dark mode"}
+        >
+          <span aria-hidden="true">{dark ? "☀️" : "🌙"}</span>
+        </button>
+
         <label className="theme-select-wrap">
           <span className="swatch" aria-hidden="true" />
-          <span className="sr-only">Accent theme</span>
-          <select
-            className="theme-select"
-            value={themeKey}
-            onChange={(e) => onThemeChange(e.target.value)}
-          >
-            {Object.entries(THEMES).map(([key, t]) => (
+          <span className="sr-only">Accent colour</span>
+          <select className="theme-select" value={accent} onChange={(e) => onAccentChange(e.target.value)}>
+            {Object.entries(ACCENTS).map(([key, label]) => (
               <option key={key} value={key}>
-                {t.label}
+                {label}
               </option>
             ))}
           </select>
@@ -496,14 +470,38 @@ function Navbar({ themeKey, onThemeChange, profile, user, onOpenAuth, onSignOut,
    HOME: TOPICS + LEAGUE
    ======================================================================== */
 
-function TopicCards({ topics, onSelect, source, total }) {
+function CloudNotice({ cloud }) {
+  if (cloud.status === "setup") {
+    return (
+      <p className="notice" role="status">
+        <b>Cloud database isn&apos;t set up yet.</b> In Supabase open <b>SQL Editor</b> and run{" "}
+        <code>supabase/schema.sql</code>. Until then, streaks, XP and ranks can&apos;t be saved or shared.
+      </p>
+    );
+  }
+  if (cloud.status === "error") {
+    return (
+      <p className="notice error" role="status">
+        Can&apos;t reach the league right now ({cloud.message}). It will retry when you come back to this tab.
+      </p>
+    );
+  }
+  return null;
+}
+
+function TopicCards({ entries, onSelect, onSelectMixed, source, total, cloud }) {
+  // Keep the group order: Numbers and algebra, Relationships and shapes, then the sheet-only topics.
+  const groups = [GROUP_NUMBERS, GROUP_SHAPES, GROUP_SHEET]
+    .map((name) => ({ name, items: entries.filter((e) => e.group === name) }))
+    .filter((g) => g.items.length > 0);
+
   return (
     <section>
-      <PieterSays>
+      <PieterSays size={130}>
         <b>Hi, I&apos;m Pieter! 👋</b>
         <br />
-        Welcome to {APP_NAME}. Pick a topic and let&apos;s practise together —
-        you&apos;ve got 3 hearts, so think carefully!
+        Welcome to {APP_NAME}. Pick a topic and let&apos;s practise together — you&apos;ve got 3 hearts, so think
+        carefully!
       </PieterSays>
 
       <h1 className="section-title">What math topic are you struggling on today?</h1>
@@ -511,67 +509,105 @@ function TopicCards({ topics, onSelect, source, total }) {
       <p className={`sync-chip ${source}`}>
         <span className="sync-dot" />
         {source === "sheet"
-          ? `Live from Google Sheets · ${total} ${total === 1 ? "question" : "questions"}`
+          ? `Live · ${total} ${total === 1 ? "question" : "questions"}`
           : `Offline question bank · ${total} ${total === 1 ? "question" : "questions"} (Google Sheet unavailable)`}
       </p>
 
-      <div className="topic-grid">
-        {topics.map((t, i) => (
-          <button key={t.name} className="topic-card" onClick={() => onSelect(t.name)}>
-            <span className="topic-icon">
-              {TOPIC_ICONS[t.name] ?? DEFAULT_ICONS[i % DEFAULT_ICONS.length]}
-            </span>
-            <span className="topic-name">{t.name}</span>
-            <span className="topic-count">
-              {t.count} {t.count === 1 ? "question" : "questions"}
-            </span>
-            <span className="topic-start">START</span>
-          </button>
-        ))}
-      </div>
+      <CloudNotice cloud={cloud} />
+
+      <button className="topic-card mixed" onClick={onSelectMixed}>
+        <span className="topic-icon"><TopicIcon kind="mixed" /></span>
+        <span className="mixed-text">
+          <span className="topic-name">Mixed Practice Challenge</span>
+          <span className="topic-blurb">
+            Every topic in one round: your Google Sheet questions shuffled with freshly generated ones.
+          </span>
+          <span className="topic-count">{SESSION_SIZE} questions per round</span>
+        </span>
+        <span className="topic-start">START</span>
+      </button>
+
+      {groups.map((g) => (
+        <div className="topic-group" key={g.name}>
+          <h2 className="group-title">{g.name}</h2>
+          <div className="topic-grid">
+            {g.items.map((t, i) => (
+              <button key={t.key} className="topic-card" onClick={() => onSelect(t)}>
+                <span className="topic-icon">
+                  <TopicIcon kind={t.def?.key ?? iconKindForSheetTopic(t.title)} fallbackIndex={i} />
+                </span>
+                <span className="topic-name">{t.title}</span>
+                {t.blurb && <span className="topic-blurb">{t.blurb}</span>}
+                <span className="topic-count">
+                  {t.def
+                    ? t.sheetCount > 0
+                      ? `Endless practice · ${t.sheetCount} from your Sheet`
+                      : "Endless practice"
+                    : `${t.sheetCount} ${t.sheetCount === 1 ? "question" : "questions"}`}
+                </span>
+                <span className="topic-start">START</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
     </section>
   );
 }
 
 const MEDALS = { 1: "🥇", 2: "🥈", 3: "🥉" };
 
-function Leaderboard({ league, user, onOpenAuth }) {
+function Leaderboard({ league, user, onOpenAuth, cloud }) {
   return (
     <section>
       <h1 className="section-title">Friends Ranking League</h1>
-      <p className="section-sub">Earn XP by finishing quizzes to climb your friends&apos; ranks.</p>
+      <p className="section-sub">Earn XP by finishing quizzes to climb the ranks. Scores update live.</p>
+
+      {cloud.status === "ok" && (
+        <p className="sync-chip live">
+          <span className="sync-dot" />
+          Live · synced with the cloud
+        </p>
+      )}
+      <CloudNotice cloud={cloud} />
 
       {!user && (
         <div className="league-cta">
           <div>
             <b>Playing as a guest</b>
-            <span>Log in to save your streak &amp; XP and appear under your own name.</span>
+            <span>Log in to save your streak &amp; XP and appear in the league under your own name.</span>
           </div>
           <button className="btn" onClick={onOpenAuth}>LOG-IN / REGISTER</button>
         </div>
       )}
 
-      <ol className="board">
-        {league.map((p) => (
-          <li
-            key={p.id}
-            className={`board-row ${p.isYou ? "you" : ""} ${p.rank <= 3 ? "top" : ""}`}
-            aria-current={p.isYou ? "true" : undefined}
-          >
-            <span className="board-rank">
-              {MEDALS[p.rank] && <span className="medal">{MEDALS[p.rank]}</span>}
-              #{p.rank}
-            </span>
-            <span className="board-avatar">{initialOf(p.name)}</span>
-            <span className="board-name">
-              {p.name}
-              {p.isYou && <em className="you-tag">{user ? "YOU" : "GUEST"}</em>}
-            </span>
-            <span className="board-streak">🔥 {p.streak}</span>
-            <span className="board-xp">{p.xp} XP</span>
-          </li>
-        ))}
-      </ol>
+      {league.length === 0 ? (
+        <p className="board-empty">
+          {cloud.status === "loading" ? "Loading the league…" : "No players yet. Be the first on the board!"}
+        </p>
+      ) : (
+        <ol className="board">
+          {league.map((p) => (
+            <li
+              key={p.id}
+              className={`board-row ${p.isYou ? "you" : ""} ${p.rank <= 3 ? "top" : ""}`}
+              aria-current={p.isYou ? "true" : undefined}
+            >
+              <span className="board-rank">
+                {MEDALS[p.rank] && <span className="medal">{MEDALS[p.rank]}</span>}
+                #{p.rank}
+              </span>
+              <span className="board-avatar">{initialOf(p.username)}</span>
+              <span className="board-name">
+                {p.username}
+                {p.isYou && <em className="you-tag">YOU</em>}
+              </span>
+              <span className="board-streak">🔥 {p.streak}</span>
+              <span className="board-xp">{p.xp} XP</span>
+            </li>
+          ))}
+        </ol>
+      )}
     </section>
   );
 }
@@ -592,42 +628,67 @@ function Hearts({ count }) {
   );
 }
 
-function Quiz({ topic, questions, onExit, onGameOver, onComplete }) {
-  // Only questions from the chosen topic, in random order.
-  const [queue] = useState(() => shuffle(questions.filter((q) => q.topic === topic)));
+function Quiz({ title, session, onExit, onGameOver, onComplete }) {
   const [index, setIndex] = useState(0);
   const [selected, setSelected] = useState(null);
   const [result, setResult] = useState(null); // null | "correct" | "wrong"
   const [hearts, setHearts] = useState(MAX_HEARTS);
   const [correctCount, setCorrectCount] = useState(0);
+  const [showHint, setShowHint] = useState(false);
 
-  const q = queue[index];
-  const total = queue.length;
+  // Session tracker: one boolean per CHECKED answer (true = correct).
+  // Its length drives Pieter's milestone pop-ups.
+  const [history, setHistory] = useState([]);
+  const [milestone, setMilestone] = useState(null); // { kind, text } | null
+  const milestoneTimer = useRef(null);
+
+  useEffect(() => () => clearTimeout(milestoneTimer.current), []);
+
+  function dismissMilestone() {
+    clearTimeout(milestoneTimer.current);
+    setMilestone(null);
+  }
+
+  const q = session[index];
+  const total = session.length;
   const progress = ((index + (result ? 1 : 0)) / total) * 100;
+  const mood = result === "correct" ? "happy" : result === "wrong" ? "oops" : null;
 
   function check() {
     if (selected === null || result) return;
-    if (selected === q.correct_answer) {
+    const ok = selected === q.correct_answer;
+    if (ok) {
       setResult("correct");
       setCorrectCount((c) => c + 1);
     } else {
       setResult("wrong");
       setHearts((h) => h - 1);
     }
+
+    // Validated check -> grow the tracker; at every multiple of 5, Pieter pops up.
+    const nextHistory = [...history, ok];
+    setHistory(nextHistory);
+    if (nextHistory.length % MILESTONE_EVERY === 0) {
+      setMilestone(milestoneMessage({ answered: nextHistory.length, streak: trailingStreak(nextHistory) }));
+      clearTimeout(milestoneTimer.current);
+      milestoneTimer.current = setTimeout(() => setMilestone(null), MILESTONE_MS);
+    }
   }
 
   function next() {
+    dismissMilestone();
     if (hearts <= 0) {
-      onGameOver({ topic, correct: correctCount, total });
+      onGameOver({ title, correct: correctCount, total });
       return;
     }
     if (index + 1 >= total) {
-      onComplete({ topic, correct: correctCount, total, heartsLeft: hearts });
+      onComplete({ title, correct: correctCount, total, heartsLeft: hearts });
       return;
     }
     setIndex(index + 1);
     setSelected(null);
     setResult(null);
+    setShowHint(false);
   }
 
   if (!q) {
@@ -650,10 +711,24 @@ function Quiz({ topic, questions, onExit, onGameOver, onComplete }) {
       </div>
 
       <div className="quiz-body">
-        <p className="quiz-topic">{topic}</p>
-        <PieterSays size={90}>
+        <p className="quiz-topic">{q.topic ?? title}</p>
+        <PieterSays size={96} mood={mood}>
           <b>{q.question}</b>
         </PieterSays>
+
+        {q.expr && <div className="plate">{q.expr}</div>}
+        {/* Only generated questions carry trusted SVG/HTML diagrams; sheet content is never injected as HTML. */}
+        {q.generated && q.visual && <div className="qvisual" dangerouslySetInnerHTML={{ __html: q.visual }} />}
+
+        {q.hint && !result && (
+          <div className="hint-row">
+            {showHint ? (
+              <p className="hint-text">💡 {q.hint}</p>
+            ) : (
+              <button className="hint-btn" onClick={() => setShowHint(true)}>💡 Need a hint?</button>
+            )}
+          </div>
+        )}
 
         <div className="choices">
           {q.choices.map((choice) => {
@@ -676,7 +751,29 @@ function Quiz({ topic, questions, onExit, onGameOver, onComplete }) {
             );
           })}
         </div>
+
+        {result === "wrong" && q.steps?.length > 0 && (
+          <div className="explain">
+            <b>How to solve it</b>
+            <ol>
+              {q.steps.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ol>
+          </div>
+        )}
       </div>
+
+      {milestone && (
+        <div className="milestone" role="status" aria-live="polite">
+          <Pieter size={72} mood="happy" />
+          <div className="milestone-text">
+            <b>{milestone.kind === "fact" ? "Pieter's fun fact" : `${history.length} answers!`}</b>
+            <p>{milestone.text}</p>
+          </div>
+          <button className="milestone-close" onClick={dismissMilestone} aria-label="Dismiss">✕</button>
+        </div>
+      )}
 
       <div className={`quiz-footer ${result ?? ""}`}>
         <div className="footer-inner">
@@ -723,10 +820,10 @@ function GameOver({ info, onRetry, onHome }) {
   return (
     <div className="center-screen">
       <div className="end-card">
-        <Pieter size={140} />
+        <Pieter size={150} mood="oops" />
         <h1 className="end-title bad">Game Over</h1>
         <p className="end-text">
-          You ran out of hearts on <b>{info.topic}</b>. You got {info.correct} of {info.total} right
+          You ran out of hearts on <b>{info.title}</b>. You got {info.correct} of {info.total} right
           before running out — keep practising and try again!
         </p>
         <Hearts count={0} />
@@ -739,14 +836,14 @@ function GameOver({ info, onRetry, onHome }) {
   );
 }
 
-function Complete({ info, earnedXp, rank, onHome, onLeaderboard }) {
+function Complete({ info, earnedXp, rank, signedIn, syncNote, onHome, onLeaderboard }) {
   return (
     <div className="center-screen">
       <div className="end-card">
-        <Pieter size={140} />
+        <Pieter size={150} mood="happy" />
         <h1 className="end-title">Lesson complete! 🎉</h1>
         <p className="end-text">
-          {info.correct} of {info.total} correct in <b>{info.topic}</b>.
+          {info.correct} of {info.total} correct in <b>{info.title}</b>.
         </p>
 
         <div className="result-stats">
@@ -760,9 +857,14 @@ function Complete({ info, earnedXp, rank, onHome, onLeaderboard }) {
           </div>
           <div className="result-stat rank">
             <span className="rs-label">LEAGUE RANK</span>
-            <span className="rs-value">#{rank}</span>
+            <span className="rs-value">{signedIn && rank ? `#${rank}` : "—"}</span>
           </div>
         </div>
+
+        {!signedIn && (
+          <p className="notice">Log in to save this XP and streak to the league. Guest progress stays on this device.</p>
+        )}
+        {syncNote && <p className="notice error" role="alert">{syncNote}</p>}
 
         <div className="end-actions">
           <button className="btn big" onClick={onHome}>CONTINUE</button>
@@ -778,7 +880,7 @@ function Complete({ info, earnedXp, rank, onHome, onLeaderboard }) {
    ======================================================================== */
 
 export default function Page() {
-  /* ---- boot sequence: π logo ≥ 2s AND hydration + sheet download finished ---- */
+  /* ---- boot sequence: π logo ≥ 2s AND hydration + sheet download + auth check finished ---- */
   const [bootMinDone, setBootMinDone] = useState(false);
   const [bootPhase, setBootPhase] = useState("loading"); // "loading" | "leaving" | "done"
 
@@ -787,33 +889,88 @@ export default function Page() {
   const [source, setSource] = useState("offline"); // "sheet" | "offline"
   const [dataReady, setDataReady] = useState(false);
 
-  /* ---- persisted state ---- */
-  const [themeKey, setThemeKey] = useState("green");
-  const [guest, setGuest] = useState(EMPTY_PROFILE); // progress while logged out
-  const [accounts, setAccounts] = useState({}); // id -> { id, displayName, provider, email?, profile }
-  const [sessionId, setSessionId] = useState(null); // id of the logged-in account
+  /* ---- theme ---- */
+  const [mode, setMode] = useState("light"); // "light" | "dark"
+  const [accent, setAccent] = useState("green");
+
+  /* ---- auth + cloud (Supabase is the single source of truth) ---- */
+  const [authUser, setAuthUser] = useState(null); // Supabase auth user | null
+  const [authReady, setAuthReady] = useState(false);
+  const [me, setMe] = useState(null); // my profiles row { id, username, xp, streak, last_active }
+  const [players, setPlayers] = useState([]); // league rows from the database
+  const [cloud, setCloud] = useState({ status: "loading" }); // loading | ok | setup | error
+
+  /* ---- guest progress (the only data kept locally) ---- */
+  const [guest, setGuest] = useState(EMPTY_PROFILE);
   const [hydrated, setHydrated] = useState(false);
 
   /* ---- ui state ---- */
-  const [friends, setFriends] = useState([]);
   const [authOpen, setAuthOpen] = useState(false);
   const [tab, setTab] = useState("learn"); // "learn" | "leaderboard"
   const [screen, setScreen] = useState("home"); // "home" | "quiz" | "gameover" | "complete"
-  const [topic, setTopic] = useState(null);
+  const [plan, setPlan] = useState(null); // what the current round is: { kind: "topic", entry } | { kind: "mixed" }
+  const [session, setSession] = useState([]);
   const [quizKey, setQuizKey] = useState(0); // remount Quiz on retry
   const [endInfo, setEndInfo] = useState(null);
   const [earnedXp, setEarnedXp] = useState(0);
+  const [syncNote, setSyncNote] = useState("");
 
-  // Derived auth state
-  const user = sessionId ? accounts[sessionId] ?? null : null;
-  const userName = user?.displayName ?? null;
-  const profile = user ? user.profile : guest;
+  const authId = authUser?.id ?? null;
+  const authUserRef = useRef(null);
+  const authIdRef = useRef(null);
+  authUserRef.current = authUser;
+  authIdRef.current = authId;
+
+  const user = authUser
+    ? {
+        id: authUser.id,
+        displayName: me?.username ?? nameFromAuthUser(authUser),
+        email: isVirtualEmail(authUser.email) ? null : authUser.email,
+      }
+    : null;
+  const profile = authUser
+    ? { xp: me?.xp ?? 0, streak: me?.streak ?? 0 }
+    : guest;
 
   /* ---------------- boot: minimum 2s timer ---------------- */
   useEffect(() => {
     const t = setTimeout(() => setBootMinDone(true), BOOT_MIN_MS);
     return () => clearTimeout(t);
   }, []);
+
+  /* ---------------- theme: read what layout.js applied before paint ---------------- */
+  useEffect(() => {
+    const root = document.documentElement;
+    const m = root.getAttribute("data-mode") === "dark" ? "dark" : "light";
+    let a = root.getAttribute("data-accent");
+    if (!ACCENTS[a]) a = "green";
+
+    // One-time migration: older versions saved only an accent as `themeKey`.
+    try {
+      if (!localStorage.getItem(THEME_KEY)) {
+        const old = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
+        if (old?.themeKey && ACCENTS[old.themeKey]) {
+          a = old.themeKey;
+          applyTheme(m, a);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    setMode(m);
+    setAccent(a);
+  }, []);
+
+  // Handlers read the *other* axis from <html> (the source of truth) rather than from a
+  // closure, so two quick changes in a row can never overwrite each other with stale state.
+  function changeMode(next) {
+    setMode(next);
+    applyTheme(next, document.documentElement.getAttribute("data-accent") || "green");
+  }
+  function changeAccent(next) {
+    setAccent(next);
+    applyTheme(document.documentElement.getAttribute("data-mode") || "light", next);
+  }
 
   /* ---------------- live Google Sheets sync ---------------- */
   useEffect(() => {
@@ -869,22 +1026,14 @@ export default function Page() {
     };
   }, []);
 
-  /* ---------------- load saved state ---------------- */
+  /* ---------------- guest progress: load / save ---------------- */
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
-      if (saved) {
-        if (saved.themeKey && THEMES[saved.themeKey]) setThemeKey(saved.themeKey);
-        if (saved.guest) setGuest(saved.guest);
-        // Drop the fake account from the old simulated Google popup: it was never
-        // a real login, so it must not stay signed in or show up in the league.
-        const { [SIMULATED_ACCOUNT_ID]: _simulated, ...realAccounts } = saved.accounts ?? {};
-        setAccounts(realAccounts);
-        if (saved.sessionId && realAccounts[saved.sessionId]) setSessionId(saved.sessionId);
+      if (saved?.guest) {
+        setGuest(saved.guest);
       } else {
-        // First launch after the rename: carry over the old guest progress.
         const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) ?? "null");
-        if (legacy?.themeKey && THEMES[legacy.themeKey]) setThemeKey(legacy.themeKey);
         if (legacy?.profile) setGuest(legacy.profile);
       }
     } catch {
@@ -893,84 +1042,119 @@ export default function Page() {
     setHydrated(true);
   }, []);
 
-  /* ---------------- save state (session + progress) ---------------- */
-  // NOTE: localStorage is not tamper-proof. See the security note in app/cloud.js.
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ themeKey, guest, accounts, sessionId }));
-  }, [themeKey, guest, accounts, sessionId, hydrated]);
+    // Only guest progress is stored here. Accounts, XP, streaks and ranks of signed-in
+    // players live in Supabase (old local username accounts are gone by design).
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ guest }));
+  }, [guest, hydrated]);
 
   /* ---------------- Supabase auth listener ---------------- */
-  // Latest values for use inside the long-lived listener below.
-  const guestRef = useRef(guest);
-  const accountsRef = useRef(accounts);
-  guestRef.current = guest;
-  accountsRef.current = accounts;
-
   useEffect(() => {
-    // Wait for localStorage to load so we know which accounts already exist.
-    if (!hydrated) return;
     let cancelled = false;
-
-    // Maps a Supabase session onto the app's user state (accounts + sessionId).
-    function applySession(session) {
-      if (!session?.user) {
-        // Signed out. Only drop a Google/Supabase login; a local username
-        // account has no Supabase session and must stay signed in.
-        setSessionId((prev) => (prev?.startsWith(GOOGLE_ID_PREFIX) ? null : prev));
-        return;
-      }
-
-      const email = session.user.email;
-      const fullName =
-        session.user.user_metadata?.full_name ?? // Google profile name
-        session.user.user_metadata?.name ??
-        email?.split("@")[0] ??
-        "Player";
-      const id = `${GOOGLE_ID_PREFIX}${(email ?? session.user.id).toLowerCase()}`;
-
-      if (accountsRef.current[id]) {
-        // Returning player: refresh name/email, keep their saved XP + streak.
-        setAccounts((prev) => ({
-          ...prev,
-          [id]: { ...prev[id], displayName: fullName, email },
-        }));
-      } else {
-        // First login: create the account, carrying over any guest progress.
-        setAccounts((prev) => ({
-          ...prev,
-          [id]: { id, displayName: fullName, email, provider: "google", profile: guestRef.current },
-        }));
-        setGuest(EMPTY_PROFILE);
-      }
-      setSessionId(id);
-      setAuthOpen(false);
-    }
+    const safety = setTimeout(() => !cancelled && setAuthReady(true), AUTH_TIMEOUT_MS);
 
     // 1) Existing session on mount (also covers the return from Google).
-    supabase.auth.getSession().then(({ data }) => {
-      if (!cancelled) applySession(data.session);
-    });
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (cancelled) return;
+        setAuthUser(data.session?.user ?? null);
+        setAuthReady(true);
+      })
+      .catch(() => !cancelled && setAuthReady(true));
 
     // 2) Live changes: SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED, ...
     //    (Keep this callback synchronous: don't await Supabase calls inside it.)
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      applySession(session);
+      setAuthUser(session?.user ?? null);
+      setAuthReady(true);
     });
 
     return () => {
       cancelled = true;
+      clearTimeout(safety);
       subscription.unsubscribe();
     };
-  }, [hydrated]);
+  }, []);
+
+  // Close the login dialog as soon as a session exists.
+  useEffect(() => {
+    if (authId) setAuthOpen(false);
+  }, [authId]);
+
+  /* ---------------- cloud: my profile, league, realtime ---------------- */
+  const upsertPlayer = useCallback((row) => {
+    setPlayers((prev) => {
+      const i = prev.findIndex((p) => p.id === row.id);
+      if (i === -1) return [...prev, row];
+      const copy = [...prev];
+      copy[i] = row;
+      return copy;
+    });
+  }, []);
+
+  // Whenever a (different) player signs in: load their profile row, creating it if needed.
+  useEffect(() => {
+    if (!authId) {
+      setMe(null);
+      return;
+    }
+    let cancelled = false;
+    ensureProfile(supabase, authUserRef.current).then(({ row, error }) => {
+      if (cancelled) return;
+      if (error) {
+        setCloud(cloudStatusFrom(error));
+        return;
+      }
+      setMe(row);
+      upsertPlayer(row);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authId, upsertPlayer]);
+
+  const refreshLeague = useCallback(async () => {
+    const { rows, error } = await fetchPlayers(supabase);
+    if (error) {
+      setCloud(cloudStatusFrom(error));
+      return;
+    }
+    setPlayers(rows);
+    setCloud({ status: "ok" });
+    const mine = authIdRef.current && rows.find((r) => r.id === authIdRef.current);
+    if (mine) setMe(mine);
+  }, []);
+
+  // League: initial load + live Supabase Realtime updates (same account on another
+  // device included) + a refresh whenever the tab becomes visible again.
+  useEffect(() => {
+    refreshLeague();
+    const unsubscribe = subscribeToProfiles(supabase, ({ type, row }) => {
+      if (type === "DELETE") {
+        setPlayers((prev) => prev.filter((p) => p.id !== row.id));
+        if (row.id === authIdRef.current) setMe(null);
+        return;
+      }
+      upsertPlayer(row);
+      if (row.id === authIdRef.current) setMe(row);
+    });
+    const onVisible = () => document.visibilityState === "visible" && refreshLeague();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      unsubscribe();
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [refreshLeague, upsertPlayer]);
 
   /* ---------------- leave the boot screen ---------------- */
   useEffect(() => {
-    if (bootPhase !== "loading" || !bootMinDone || !dataReady || !hydrated) return;
+    if (bootPhase !== "loading" || !bootMinDone || !dataReady || !hydrated || !authReady) return;
     setBootPhase("leaving");
-  }, [bootPhase, bootMinDone, dataReady, hydrated]);
+  }, [bootPhase, bootMinDone, dataReady, hydrated, authReady]);
 
   useEffect(() => {
     if (bootPhase !== "leaving") return;
@@ -978,92 +1162,97 @@ export default function Page() {
     return () => clearTimeout(t);
   }, [bootPhase]);
 
-  /* ---------------- friends league + cloud sync hooks ---------------- */
-  useEffect(() => {
-    let cancelled = false;
-    fetchFriendsLeague(sessionId).then((rows) => {
-      if (!cancelled) setFriends(rows);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId]);
-
-  useEffect(() => {
-    if (!hydrated || !sessionId) return;
-    syncProfileToCloud(sessionId, profile);
-  }, [hydrated, sessionId, profile]);
-
   /* ---------------- derived data ---------------- */
-  // Unique topics, in the order they appear in the sheet.
-  const topics = useMemo(() => {
-    const map = new Map();
-    for (const q of questions) map.set(q.topic, (map.get(q.topic) ?? 0) + 1);
-    return [...map].map(([name, count]) => ({ name, count }));
+  // Topic cards: every generator topic (with any matching sheet topics folded in),
+  // plus sheet topics no generator covers ("From your Google Sheet").
+  const entries = useMemo(() => {
+    const byKey = new Map(
+      TOPIC_DEFS.map((def) => [
+        def.key,
+        { key: def.key, def, title: def.label, group: def.group, blurb: def.blurb, sheetNames: [], sheetCount: 0 },
+      ])
+    );
+    const extra = new Map();
+    for (const q of questions) {
+      const def = topicDefFor(q.topic);
+      if (def) {
+        const e = byKey.get(def.key);
+        if (!e.sheetNames.includes(q.topic)) e.sheetNames.push(q.topic);
+        e.sheetCount++;
+      } else {
+        if (!extra.has(q.topic)) {
+          extra.set(q.topic, {
+            key: `sheet:${q.topic}`,
+            def: null,
+            title: q.topic,
+            group: GROUP_SHEET,
+            blurb: "",
+            sheetNames: [q.topic],
+            sheetCount: 0,
+          });
+        }
+        extra.get(q.topic).sheetCount++;
+      }
+    }
+    return [...byKey.values(), ...extra.values()];
   }, [questions]);
 
   const league = useMemo(
     () =>
-      buildLeague({
-        friends,
-        others: Object.values(accounts).filter((a) => a.id !== sessionId),
-        you: {
-          id: sessionId ?? "guest",
-          name: userName ?? "You",
-          xp: profile.xp,
-          streak: profile.streak,
-        },
-      }),
-    [friends, accounts, sessionId, userName, profile]
+      [...players]
+        .sort((a, b) => b.xp - a.xp || a.username.localeCompare(b.username))
+        .map((p, i) => ({ ...p, rank: i + 1, isYou: p.id === authId })),
+    [players, authId]
   );
-  const myRank = league.find((p) => p.isYou).rank;
+  const myRank = league.find((p) => p.isYou)?.rank ?? null;
 
-  const theme = THEMES[themeKey];
-  const themeVars = {
-    "--accent": theme.accent,
-    "--accent-dark": theme.dark,
-    "--accent-light": theme.light,
-  };
-
-  /* ---------------- profile + auth actions ---------------- */
-  function updateProfile(next) {
-    if (user) {
-      setAccounts((a) => ({ ...a, [user.id]: { ...a[user.id], profile: next } }));
-    } else {
-      setGuest(next);
+  /* ---------------- auth actions ---------------- */
+  // Username + password sign-up. The username becomes the virtual email
+  // `${username}@octopi.edu`; the database trigger then creates the profile row.
+  async function handleRegister(rawName, password) {
+    const username = rawName.trim();
+    if (!USERNAME_RE.test(username)) {
+      return { ok: false, error: "Use 3–16 letters, numbers, _ or -" };
+    }
+    if (password.length < MIN_PASSWORD) {
+      return { ok: false, error: `Password must be at least ${MIN_PASSWORD} characters.` };
+    }
+    try {
+      const email = usernameToEmail(username);
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: { data: { username } },
+      });
+      if (error) return { ok: false, error: describeAuthError(error) };
+      // With email confirmation on, Supabase hides duplicates by returning a user with no identities.
+      if (data.user && data.user.identities?.length === 0) {
+        return { ok: false, error: "That username is already taken. Try another one." };
+      }
+      if (!data.session) {
+        // No session yet: try to log in straight away. If "Confirm email" is still enabled
+        // in the dashboard this fails with a clear explanation.
+        const res = await supabase.auth.signInWithPassword({ email, password });
+        if (res.error) return { ok: false, error: describeAuthError(res.error) };
+      }
+      return { ok: true }; // the auth listener picks up the session and closes the dialog
+    } catch (err) {
+      return { ok: false, error: describeAuthError(err) };
     }
   }
 
-  // Creates an account (carrying over any guest progress) and signs in.
-  function createAccountAndSignIn(account) {
-    setAccounts((a) => ({ ...a, [account.id]: { ...account, profile: guest } }));
-    setGuest(EMPTY_PROFILE);
-    setSessionId(account.id);
-    setAuthOpen(false);
-  }
-
-  async function handleRegister(rawName) {
-    const name = rawName.trim();
-    if (!USERNAME_RE.test(name)) {
-      return { ok: false, error: "Use 3–16 letters, numbers, _ . or -" };
+  async function handleLogin(rawName, password) {
+    const username = rawName.trim();
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: usernameToEmail(username), // `${username}@octopi.edu`
+        password,
+      });
+      if (error) return { ok: false, error: describeAuthError(error) };
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: describeAuthError(err) };
     }
-    const id = `user:${name.toLowerCase()}`;
-    if (accounts[id] || (await isUsernameTakenInCloud(name))) {
-      return { ok: false, error: `"${name}" is already taken. Try another username.` };
-    }
-    createAccountAndSignIn({ id, displayName: name, provider: "username" });
-    return { ok: true };
-  }
-
-  async function handleLogin(rawName) {
-    const name = rawName.trim();
-    const account = accounts[`user:${name.toLowerCase()}`];
-    if (!account) {
-      return { ok: false, error: `No account named "${name}" on this device. Register first.` };
-    }
-    setSessionId(account.id);
-    setAuthOpen(false);
-    return { ok: true };
   }
 
   // Real Google login. Sends the browser to Google; when Google sends the player
@@ -1085,18 +1274,24 @@ export default function Page() {
 
   async function handleSignOut() {
     try {
-      await supabase.auth.signOut(); // ends the Supabase session (no-op if there is none)
+      await supabase.auth.signOut(); // ends the Supabase session
     } catch (err) {
       console.warn("[OctoPi] Supabase sign-out failed:", err.message);
     }
-    setSessionId(null); // also covers username accounts, which have no Supabase session
+    setAuthUser(null);
+    setMe(null);
     setTab("learn");
     setScreen("home");
   }
 
   /* ---------------- quiz flow ---------------- */
-  function startQuiz(name) {
-    setTopic(name);
+  function startPlan(nextPlan) {
+    const round =
+      nextPlan.kind === "mixed"
+        ? buildMixedSession(questions)
+        : buildTopicSession(nextPlan.entry, questions).slice(0, SESSION_SIZE);
+    setPlan(nextPlan);
+    setSession(round);
     setQuizKey((k) => k + 1);
     setScreen("quiz");
   }
@@ -1106,18 +1301,38 @@ export default function Page() {
     setScreen("home");
   }
 
-  function handleComplete(info) {
+  async function handleComplete(info) {
     const earned = info.correct * XP_PER_CORRECT + info.heartsLeft * XP_PER_HEART_LEFT;
-
-    // Streak: +1 if last active yesterday, unchanged if today, otherwise restart at 1.
-    let streak = 1;
-    if (profile.lastActive === todayKey()) streak = Math.max(profile.streak, 1);
-    else if (profile.lastActive === todayKey(-1)) streak = profile.streak + 1;
-
-    updateProfile({ xp: profile.xp + earned, streak, lastActive: todayKey() });
     setEarnedXp(earned);
     setEndInfo(info);
+    setSyncNote("");
     setScreen("complete");
+
+    if (authUser) {
+      // Signed in: the database does the XP + streak maths (award_xp in schema.sql), and every
+      // device sees the result through Realtime.
+      const { row, error } = await awardXp(supabase, earned);
+      if (error) {
+        setSyncNote(
+          isMissingSchema(error)
+            ? "Couldn't save your XP: the cloud database isn't set up yet (run supabase/schema.sql in Supabase)."
+            : `Couldn't save your XP to the cloud: ${error.message}`
+        );
+        if (isMissingSchema(error)) setCloud({ status: "setup" });
+      } else if (row) {
+        setMe(row);
+        upsertPlayer(row);
+      }
+    } else {
+      // Guest: progress stays on this device. Streak: +1 if last active yesterday, unchanged if
+      // today, otherwise restart at 1.
+      setGuest((g) => {
+        let streak = 1;
+        if (g.lastActive === todayKey()) streak = Math.max(g.streak, 1);
+        else if (g.lastActive === todayKey(-1)) streak = g.streak + 1;
+        return { xp: g.xp + earned, streak, lastActive: todayKey() };
+      });
+    }
   }
 
   function handleGameOver(info) {
@@ -1129,7 +1344,7 @@ export default function Page() {
   const booting = bootPhase !== "done";
 
   return (
-    <div className="app" style={themeVars}>
+    <div className="app">
       <MathBackground />
 
       {bootPhase !== "loading" && (
@@ -1137,27 +1352,31 @@ export default function Page() {
           {screen === "quiz" ? (
             <Quiz
               key={quizKey}
-              topic={topic}
-              questions={questions}
+              title={plan?.kind === "mixed" ? "Mixed Practice Challenge" : plan?.entry?.title ?? ""}
+              session={session}
               onExit={() => goHome()}
               onGameOver={handleGameOver}
               onComplete={handleComplete}
             />
           ) : screen === "gameover" ? (
-            <GameOver info={endInfo} onRetry={() => startQuiz(topic)} onHome={() => goHome()} />
+            <GameOver info={endInfo} onRetry={() => startPlan(plan)} onHome={() => goHome()} />
           ) : screen === "complete" ? (
             <Complete
               info={endInfo}
               earnedXp={earnedXp}
               rank={myRank}
+              signedIn={!!authUser}
+              syncNote={syncNote}
               onHome={() => goHome()}
               onLeaderboard={() => goHome("leaderboard")}
             />
           ) : (
             <>
               <Navbar
-                themeKey={themeKey}
-                onThemeChange={setThemeKey}
+                mode={mode}
+                onToggleMode={() => changeMode(mode === "dark" ? "light" : "dark")}
+                accent={accent}
+                onAccentChange={changeAccent}
                 profile={profile}
                 user={user}
                 onOpenAuth={() => setAuthOpen(true)}
@@ -1187,13 +1406,15 @@ export default function Page() {
 
                 {tab === "learn" ? (
                   <TopicCards
-                    topics={topics}
-                    onSelect={startQuiz}
+                    entries={entries}
+                    onSelect={(entry) => startPlan({ kind: "topic", entry })}
+                    onSelectMixed={() => startPlan({ kind: "mixed" })}
                     source={source}
                     total={questions.length}
+                    cloud={cloud}
                   />
                 ) : (
-                  <Leaderboard league={league} user={user} onOpenAuth={() => setAuthOpen(true)} />
+                  <Leaderboard league={league} user={user} onOpenAuth={() => setAuthOpen(true)} cloud={cloud} />
                 )}
               </main>
             </>
