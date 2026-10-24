@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { questions as fallbackQuestions } from "./questions";
 import { parseQuestionsFromCSV } from "./sheet";
@@ -27,7 +27,7 @@ import {
   subscribeToProfiles,
   usernameToEmail,
 } from "./cloud";
-import { Pieter, PieterSays } from "./pieter";
+import { Pieter, PieterSays, QUIPS, QUIP_MS } from "./pieter";
 import { TopicIcon, iconKindForSheetTopic } from "./icons";
 import { MILESTONE_EVERY, milestoneMessage, trailingStreak } from "./milestones";
 
@@ -84,6 +84,42 @@ const LEGACY_STORAGE_KEY = "mathlingo-state-v1";
 const THEME_KEY = "octopi-theme"; // must match the inline script in layout.js
 
 const EMPTY_PROFILE = { xp: 0, streak: 0, lastActive: null };
+
+// ---- Pieter's home-page greeting manager --------------------------------------------
+const VISITED_KEY = "octopi-visited-v1"; // set on the first ever visit; its presence = "repeat visitor"
+const FIRST_GREETING_MS = 3000; // first-time guest: the intro greeting shows for exactly this long
+const WELCOME_TYPE_MS = 38; // typewriter speed for the signed-in welcome line (silent, no audio)
+const WELCOME_HOLD_MS = 3000; // the finished welcome line stays for exactly this long
+// Idle call-outs: after a randomized 3 to 5 minutes without any interaction on the home page.
+const IDLE_MIN_MS = 3 * 60 * 1000;
+const IDLE_MAX_MS = 5 * 60 * 1000;
+const CALLOUT_MS = 9000; // how long a call-out stays in the bubble
+const ACTIVITY_EVENTS = ["pointermove", "pointerdown", "click", "touchstart", "touchmove", "keydown", "wheel", "scroll"];
+
+const IDLE_PROMPTS = [
+  "Hey, let's learn now!",
+  "Math won't solve itself, let's jump into a quiz!",
+  "Your daily streak is waiting for you! Let's go!",
+  "Psst! A 10-question round only takes a few minutes.",
+  "Your brain called. It wants a workout!",
+  "I'm getting bored over here... pick a topic!",
+];
+
+const pickRandom = (list) => list[Math.floor(Math.random() * list.length)];
+const randomIdleDelay = () => IDLE_MIN_MS + Math.random() * (IDLE_MAX_MS - IDLE_MIN_MS);
+
+// Welcome line for a signed-in player. Streak lines are only used when they are true.
+function pickWelcome(name, streak, isNew) {
+  if (isNew) return `Welcome to ${APP_NAME}, ${name}! Let's earn your very first XP!`;
+  const pool = [
+    `Welcome back ${name}! Nice efforts you got there!`,
+    `Great to see you again ${name}! Ready to make your brain stronger?`,
+  ];
+  if (streak >= 7) pool.push(`${streak} days in a row, that's over a week of continuous learning! Keep it up ${name}.`);
+  else if (streak >= 5) pool.push(`Almost a week of continuous learning! Keep it up ${name}.`);
+  else if (streak >= 2) pool.push(`${streak} days of continuous learning! Keep it up ${name}.`);
+  return pickRandom(pool);
+}
 
 // Accent colours (the actual values live in globals.css, per mode).
 const ACCENTS = {
@@ -489,7 +525,37 @@ function CloudNotice({ cloud }) {
   return null;
 }
 
-function TopicCards({ entries, onSelect, onSelectMixed, source, total, cloud }) {
+/**
+ * What Pieter's home bubble shows. `hero` comes from the greeting manager in <Page/>:
+ *   { kind: "greeting" }                         the standard "Hi, I'm Pieter!" intro
+ *   { kind: "typing", text, full }               welcome-back line, typed out silently
+ *   { kind: "line", text }                       a plain line (idle chatter, call-outs, click replies)
+ */
+function HeroBubble({ hero }) {
+  if (hero.kind === "typing") {
+    return (
+      <>
+        {/* Screen readers get the whole sentence at once instead of letter by letter. */}
+        <span className="sr-only">{hero.full}</span>
+        <b aria-hidden="true">
+          {hero.text}
+          <span className="type-caret" />
+        </b>
+      </>
+    );
+  }
+  if (hero.kind === "line") return <b>{hero.text}</b>;
+  return (
+    <>
+      <b>Hi, I&apos;m Pieter! 👋</b>
+      <br />
+      Welcome to {APP_NAME}. Pick a topic and let&apos;s practise together — you&apos;ve got 3 hearts, so think
+      carefully!
+    </>
+  );
+}
+
+function TopicCards({ entries, onSelect, onSelectMixed, source, total, cloud, hero, onPieterQuip }) {
   // Keep the group order: Numbers and algebra, Relationships and shapes, then the sheet-only topics.
   const groups = [GROUP_NUMBERS, GROUP_SHAPES, GROUP_SHEET]
     .map((name) => ({ name, items: entries.filter((e) => e.group === name) }))
@@ -497,11 +563,8 @@ function TopicCards({ entries, onSelect, onSelectMixed, source, total, cloud }) 
 
   return (
     <section>
-      <PieterSays size={130}>
-        <b>Hi, I&apos;m Pieter! 👋</b>
-        <br />
-        Welcome to {APP_NAME}. Pick a topic and let&apos;s practise together — you&apos;ve got 3 hearts, so think
-        carefully!
+      <PieterSays size={130} className="hero" mood={hero.mood ?? null} onQuip={onPieterQuip}>
+        <HeroBubble hero={hero} />
       </PieterSays>
 
       <h1 className="section-title">What math topic are you struggling on today?</h1>
@@ -541,7 +604,7 @@ function TopicCards({ entries, onSelect, onSelectMixed, source, total, cloud }) 
                 <span className="topic-count">
                   {t.def
                     ? t.sheetCount > 0
-                      ? `Endless practice · ${t.sheetCount} from your Sheet`
+                      ? `Endless practice · ${t.sheetCount} ${t.sheetCount === 1 ? "Question" : "Questions"}`
                       : "Endless practice"
                     : `${t.sheetCount} ${t.sheetCount === 1 ? "question" : "questions"}`}
                 </span>
@@ -560,6 +623,10 @@ const MEDALS = { 1: "🥇", 2: "🥈", 3: "🥉" };
 function Leaderboard({ league, user, onOpenAuth, cloud }) {
   return (
     <section>
+      {/* Same mascot, same size as on the dashboard; he reacts to clicks like everywhere else. */}
+      <div className="league-pieter">
+        <Pieter size={130} />
+      </div>
       <h1 className="section-title">Friends Ranking League</h1>
       <p className="section-sub">Earn XP by finishing quizzes to climb the ranks. Scores update live.</p>
 
@@ -625,6 +692,111 @@ function Hearts({ count }) {
         </span>
       ))}
     </div>
+  );
+}
+
+/* ---------- Graph plotter for sheet questions that have `graph_data` ---------- */
+
+const fmtNum = (n) => String(+n.toFixed(2)).replace("-", "−"); // typographic minus, no 1e-16 noise
+
+// A tick spacing of 1, 2, 5 or 10 × 10ⁿ that gives roughly six grid cells across `span`.
+function niceStep(span) {
+  const raw = Math.max(span, 1e-9) / 6;
+  const p = 10 ** Math.floor(Math.log10(raw));
+  const f = raw / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+}
+
+/**
+ * Coordinate grid built with plain React SVG elements (no HTML injection).
+ *   points: [[x, y], ...] straight from the sheet's graph_data column.
+ * The range always includes the axes, grows to fit every point, and the plotted
+ * points are labelled. Collinear points are drawn as one straight line running to
+ * the edges of the grid; anything else is joined point to point.
+ */
+function GraphPlot({ points }) {
+  const clipId = useId().replace(/:/g, "");
+  const W = 320;
+  const H = 320;
+  const pad = 34;
+
+  const xs = points.map((p) => p[0]);
+  const ys = points.map((p) => p[1]);
+  const stepX = niceStep(Math.max(...xs, 0) - Math.min(...xs, 0));
+  const stepY = niceStep(Math.max(...ys, 0) - Math.min(...ys, 0));
+  const minX = Math.floor(Math.min(...xs, 0) / stepX) * stepX - stepX;
+  const maxX = Math.ceil(Math.max(...xs, 0) / stepX) * stepX + stepX;
+  const minY = Math.floor(Math.min(...ys, 0) / stepY) * stepY - stepY;
+  const maxY = Math.ceil(Math.max(...ys, 0) / stepY) * stepY + stepY;
+
+  const sx = (x) => pad + ((x - minX) / (maxX - minX)) * (W - 2 * pad);
+  const sy = (y) => H - pad - ((y - minY) / (maxY - minY)) * (H - 2 * pad);
+
+  const ticks = (min, max, step) => {
+    const out = [];
+    for (let k = Math.ceil(min / step - 1e-9); k * step <= max + 1e-9; k++) out.push(+(k * step).toFixed(10));
+    return out;
+  };
+  const xTicks = ticks(minX, maxX, stepX);
+  const yTicks = ticks(minY, maxY, stepY);
+
+  // Are all points on one straight line? (cross product against the first two distinct points)
+  const [a] = points;
+  const b = points.find((p) => p[0] !== a[0] || p[1] !== a[1]);
+  const collinear = points.every(
+    (p) => Math.abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) < 1e-9
+  );
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const far = (maxX - minX + maxY - minY) * 2;
+  const len = Math.hypot(dx, dy);
+  const line = collinear
+    ? { x1: a[0] - (dx / len) * far, y1: a[1] - (dy / len) * far, x2: a[0] + (dx / len) * far, y2: a[1] + (dy / len) * far }
+    : null;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width={W} role="img" aria-label={`Graph through the points ${points.map(([x, y]) => `(${fmtNum(x)}, ${fmtNum(y)})`).join(", ")}`}>
+      <defs>
+        <clipPath id={clipId}>
+          <rect x={pad} y={pad} width={W - 2 * pad} height={H - 2 * pad} />
+        </clipPath>
+      </defs>
+
+      {xTicks.map((t) => <line key={`gx${t}`} className="gl" x1={sx(t)} y1={sy(minY)} x2={sx(t)} y2={sy(maxY)} />)}
+      {yTicks.map((t) => <line key={`gy${t}`} className="gl" x1={sx(minX)} y1={sy(t)} x2={sx(maxX)} y2={sy(t)} />)}
+
+      <line className="ax" x1={sx(minX)} y1={sy(0)} x2={sx(maxX)} y2={sy(0)} />
+      <line className="ax" x1={sx(0)} y1={sy(minY)} x2={sx(0)} y2={sy(maxY)} />
+      <text className="tx acc" x={sx(maxX) - 4} y={sy(0) - 8} textAnchor="end">x</text>
+      <text className="tx acc" x={sx(0) + 9} y={sy(maxY) + 12}>y</text>
+
+      {xTicks.filter((t) => t !== 0).map((t) => (
+        <text key={`lx${t}`} className="tx soft" x={sx(t)} y={sy(0) + 15} textAnchor="middle">{fmtNum(t)}</text>
+      ))}
+      {yTicks.filter((t) => t !== 0).map((t) => (
+        <text key={`ly${t}`} className="tx soft" x={sx(0) - 7} y={sy(t) + 4} textAnchor="end">{fmtNum(t)}</text>
+      ))}
+
+      <g clipPath={`url(#${clipId})`}>
+        {line ? (
+          <line className="ln" x1={sx(line.x1)} y1={sy(line.y1)} x2={sx(line.x2)} y2={sy(line.y2)} />
+        ) : (
+          <polyline className="ln" fill="none" points={points.map(([x, y]) => `${sx(x)},${sy(y)}`).join(" ")} />
+        )}
+      </g>
+
+      {points.map(([x, y], i) => {
+        const left = sx(x) > W - pad - 60;
+        return (
+          <g key={i}>
+            <circle className="pt" cx={sx(x)} cy={sy(y)} r="5" />
+            <text className="tx" x={sx(x) + (left ? -9 : 9)} y={sy(y) - 8} textAnchor={left ? "end" : "start"}>
+              ({fmtNum(x)}, {fmtNum(y)})
+            </text>
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 
@@ -719,6 +891,12 @@ function Quiz({ title, session, onExit, onGameOver, onComplete }) {
         {q.expr && <div className="plate">{q.expr}</div>}
         {/* Only generated questions carry trusted SVG/HTML diagrams; sheet content is never injected as HTML. */}
         {q.generated && q.visual && <div className="qvisual" dangerouslySetInnerHTML={{ __html: q.visual }} />}
+        {/* Sheet questions with a graph_data cell: plotted with real SVG elements, no HTML injection. */}
+        {!q.visual && q.graph && (
+          <div className="qvisual">
+            <GraphPlot points={q.graph} />
+          </div>
+        )}
 
         {q.hint && !result && (
           <div className="hint-row">
@@ -931,6 +1109,171 @@ export default function Page() {
   const profile = authUser
     ? { xp: me?.xp ?? 0, streak: me?.streak ?? 0 }
     : guest;
+
+  /* ---------------- Pieter's greeting manager (home page bubble) ----------------
+     heroPhase decides the base text of the bubble:
+       "greeting"  the standard intro. First-time guest: shown for exactly 3s, then it clears.
+                   Returning guest: stays, as a standing prompt to register.
+       "welcome"   signed-in player: a welcome-back line typed out silently (no audio); once
+                   typing finishes it stays exactly 3s.
+       "idle"      Pieter's standard laughing dialogue (what both of the above fall back to).
+     On top of that, a click reply (pokeLine) or an idle call-out (callout) can take over the
+     bubble for a few seconds. */
+  const [visitReady, setVisitReady] = useState(false);
+  const [heroPhase, setHeroPhase] = useState("greeting"); // "greeting" | "welcome" | "idle"
+  const [welcomeText, setWelcomeText] = useState("");
+  const [typedLen, setTypedLen] = useState(0);
+  const [idleLine, setIdleLine] = useState(QUIPS[0]);
+  const [pokeLine, setPokeLine] = useState(null);
+  const [callout, setCallout] = useState(null);
+
+  const visitRef = useRef(null); // "first" | "returning" (a ref, so React's dev double-mount can't flip it)
+  const registeringRef = useRef(false); // true between pressing REGISTER and the welcome line
+  const pokeTimer = useRef(null);
+  const calloutTimer = useRef(null);
+  const lastPrompt = useRef("");
+  const displayNameRef = useRef("");
+  const streakRef = useRef(0);
+  displayNameRef.current = user?.displayName ?? "";
+  streakRef.current = profile.streak;
+
+  // The bubble only matters (and the timers only run) while the home dashboard is on screen.
+  const heroVisible = bootPhase === "done" && screen === "home" && tab === "learn";
+
+  // Repeat-visit tracking (localStorage). Old installs that only have the guest-progress key count as repeat.
+  useEffect(() => {
+    if (visitRef.current === null) {
+      let seen = false;
+      try {
+        seen = !!(localStorage.getItem(VISITED_KEY) || localStorage.getItem(STORAGE_KEY));
+        localStorage.setItem(VISITED_KEY, String(Date.now()));
+      } catch {
+        /* storage unavailable: treated as a first visit every time */
+      }
+      visitRef.current = seen ? "returning" : "first";
+    }
+    setVisitReady(true);
+  }, []);
+
+  // Pick the phase when the app is ready and whenever the signed-in player changes.
+  useEffect(() => {
+    if (bootPhase !== "done" || !visitReady) return;
+    if (authId) {
+      const isNew = registeringRef.current;
+      registeringRef.current = false;
+      setWelcomeText(pickWelcome(displayNameRef.current || "friend", streakRef.current, isNew));
+      setTypedLen(0); // start the new line from an empty bubble (no flash of the previous length)
+      setHeroPhase("welcome");
+    } else {
+      setHeroPhase("greeting");
+    }
+  }, [bootPhase, visitReady, authId]);
+
+  // First-time guest: the greeting lasts exactly 3 seconds, then clears to the standard dialogue.
+  useEffect(() => {
+    if (!heroVisible || !visitReady || authId || heroPhase !== "greeting" || visitRef.current !== "first") return;
+    const t = setTimeout(() => {
+      visitRef.current = "returning"; // from now on this guest gets the persistent greeting
+      setIdleLine(pickRandom(QUIPS));
+      setHeroPhase("idle");
+    }, FIRST_GREETING_MS);
+    return () => clearTimeout(t);
+  }, [heroVisible, visitReady, authId, heroPhase]);
+
+  // Signed-in welcome: silent typewriter, then exactly 3s on screen, then the standard dialogue.
+  useEffect(() => {
+    if (!heroVisible || heroPhase !== "welcome") return;
+    let hold;
+    const finish = () => {
+      hold = setTimeout(() => {
+        setIdleLine(pickRandom(QUIPS));
+        setHeroPhase("idle");
+      }, WELCOME_HOLD_MS);
+    };
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      setTypedLen(welcomeText.length); // no typing animation for people who asked for less motion
+      finish();
+      return () => clearTimeout(hold);
+    }
+    setTypedLen(0);
+    let i = 0;
+    const iv = setInterval(() => {
+      i += 1;
+      setTypedLen(i);
+      if (i >= welcomeText.length) {
+        clearInterval(iv);
+        finish();
+      }
+    }, WELCOME_TYPE_MS);
+    return () => {
+      clearInterval(iv);
+      clearTimeout(hold);
+    };
+  }, [heroVisible, heroPhase, welcomeText]);
+
+  // Click / tap on Pieter: his laugh line replaces the bubble text for a moment.
+  const handlePieterQuip = useCallback((text) => {
+    setCallout(null);
+    setPokeLine(text);
+    clearTimeout(pokeTimer.current);
+    pokeTimer.current = setTimeout(() => setPokeLine(null), QUIP_MS);
+  }, []);
+
+  // Ambient idle call-outs. Any cursor move, click, key press, scroll or touch resets the clock.
+  // The listener exists only while the home dashboard is showing, so it is off during a quiz.
+  useEffect(() => {
+    if (!heroVisible) return;
+    let lastActive = Date.now();
+    let delay = randomIdleDelay();
+    let timer;
+
+    const onActivity = () => {
+      lastActive = Date.now(); // cheap on purpose: this fires on every mouse move
+      delay = randomIdleDelay(); // a fresh random 3 to 5 minute window after each interaction
+    };
+    const check = () => {
+      const idleFor = Date.now() - lastActive;
+      if (idleFor < delay) {
+        timer = setTimeout(check, delay - idleFor); // activity moved the deadline: wait the rest
+        return;
+      }
+      if (document.visibilityState === "visible") {
+        let prompt;
+        do prompt = pickRandom(IDLE_PROMPTS);
+        while (prompt === lastPrompt.current && IDLE_PROMPTS.length > 1);
+        lastPrompt.current = prompt;
+        setPokeLine(null);
+        setCallout(prompt);
+        clearTimeout(calloutTimer.current);
+        calloutTimer.current = setTimeout(() => setCallout(null), CALLOUT_MS);
+      }
+      lastActive = Date.now();
+      delay = randomIdleDelay();
+      timer = setTimeout(check, delay);
+    };
+
+    ACTIVITY_EVENTS.forEach((e) => window.addEventListener(e, onActivity, { passive: true }));
+    timer = setTimeout(check, delay);
+    return () => {
+      ACTIVITY_EVENTS.forEach((e) => window.removeEventListener(e, onActivity));
+      clearTimeout(timer);
+      clearTimeout(calloutTimer.current);
+      setCallout(null);
+    };
+  }, [heroVisible]);
+
+  useEffect(() => () => clearTimeout(pokeTimer.current), []);
+
+  // What the bubble shows right now (click reply > call-out > the phase's own text).
+  const hero = pokeLine
+    ? { kind: "line", text: pokeLine }
+    : callout
+      ? { kind: "line", text: callout, mood: "happy" }
+      : heroPhase === "welcome" || (authId && heroPhase === "greeting") // signed in: never flash the guest greeting
+        ? { kind: "typing", text: welcomeText.slice(0, typedLen), full: welcomeText }
+        : heroPhase === "idle"
+          ? { kind: "line", text: idleLine }
+          : { kind: "greeting" };
 
   /* ---------------- boot: minimum 2s timer ---------------- */
   useEffect(() => {
@@ -1164,7 +1507,7 @@ export default function Page() {
 
   /* ---------------- derived data ---------------- */
   // Topic cards: every generator topic (with any matching sheet topics folded in),
-  // plus sheet topics no generator covers ("From your Google Sheet").
+  // plus sheet topics no generator covers (grouped under "Others").
   const entries = useMemo(() => {
     const byKey = new Map(
       TOPIC_DEFS.map((def) => [
@@ -1210,6 +1553,13 @@ export default function Page() {
   // Username + password sign-up. The username becomes the virtual email
   // `${username}@octopi.edu`; the database trigger then creates the profile row.
   async function handleRegister(rawName, password) {
+    registeringRef.current = true; // so Pieter says "Welcome to OctoPi" to a new player, not "Welcome back"
+    const res = await registerAccount(rawName, password);
+    if (!res.ok) registeringRef.current = false;
+    return res;
+  }
+
+  async function registerAccount(rawName, password) {
     const username = rawName.trim();
     if (!USERNAME_RE.test(username)) {
       return { ok: false, error: "Use 3–16 letters, numbers, _ or -" };
@@ -1412,6 +1762,8 @@ export default function Page() {
                     source={source}
                     total={questions.length}
                     cloud={cloud}
+                    hero={hero}
+                    onPieterQuip={handlePieterQuip}
                   />
                 ) : (
                   <Leaderboard league={league} user={user} onOpenAuth={() => setAuthOpen(true)} cloud={cloud} />

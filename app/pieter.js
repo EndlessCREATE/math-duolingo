@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 // What Pieter says when you click or tap him. Add more lines freely.
-const QUIPS = [
+export const QUIPS = [
   "Hahaha! That tickles!",
   "Hehe! Stop it, that tickles!",
   "Hahaha! You found my ticklish spot!",
@@ -18,7 +18,7 @@ const QUIPS = [
   "Tee-hee! Right back at you, friend!",
 ];
 const BACK_TO_WORK = "Hahaha, okay! Ready to do some math now?";
-const QUIP_MS = 2400; // how long the laugh + bubble last
+export const QUIP_MS = 2400; // how long the laugh + bubble last
 
 // ---------------------------------------------------------------------------
 // PIETER — kinetic mascot
@@ -112,7 +112,7 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
  * @param size  rendered width in px (the viewBox keeps the aspect ratio exactly)
  * @param mood  null | "happy" | "oops"   (also drives a jump / slump animation)
  */
-export function Pieter({ size = 120, mood = null }) {
+export function Pieter({ size = 120, mood = null, onQuip = null }) {
   const wrapRef = useRef(null);
   const stageRef = useRef(null);
 
@@ -135,6 +135,7 @@ export function Pieter({ size = 120, mood = null }) {
     // Every 7th poke he asks to get back to the maths.
     const text = pokes.current % 7 === 0 ? BACK_TO_WORK : QUIPS[i];
     setQuip({ id: pokes.current, text });
+    onQuip?.(text); // a parent that owns a speech bubble can show the line there instead
     clearTimeout(quipTimer.current);
     quipTimer.current = setTimeout(() => setQuip(null), QUIP_MS);
   }
@@ -179,7 +180,7 @@ export function Pieter({ size = 120, mood = null }) {
       className={`pwrap idle${laughing ? " mood-happy laugh" : mood ? ` mood-${mood}` : ""}`}
       style={{ width: size, "--pw": `${size}px` }}
     >
-      {quip && (
+      {quip && !onQuip && (
         <span key={quip.id} className="quip" role="status">
           {quip.text}
         </span>
@@ -241,10 +242,10 @@ export function Pieter({ size = 120, mood = null }) {
 }
 
 /** Pieter on the left, speech bubble on the right (used for questions + the home hero). */
-export function PieterSays({ children, size = 120, mood = null, className = "" }) {
+export function PieterSays({ children, size = 120, mood = null, className = "", onQuip = null }) {
   return (
     <div className={`pieter-row ${className}`}>
-      <Pieter size={size} mood={mood} />
+      <Pieter size={size} mood={mood} onQuip={onQuip} />
       <div className="bubble">{children}</div>
     </div>
   );

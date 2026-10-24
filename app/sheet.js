@@ -5,10 +5,18 @@
 //
 //   id | topic | question | choices | correct_answer
 //
-//   - `choices` is ONE cell with comma-separated answers, e.g.  15, 18, 20, 36
-//     (wrap the whole cell in quotes if your sheet export doesn't do it for you).
+//   - `choices` (or `options`) is ONE cell with answers separated by a pipe "|", e.g.
+//         Option A | Option B, with details | 49,000 | Option D
+//     so commas inside an answer are safe. (A cell with no "|" at all is still read
+//     as comma-separated, the old format, so unconverted rows keep working.)
 //   - `correct_answer` must match one of the choices (case-insensitive).
 //   - Alternatively use four columns: choice_a | choice_b | choice_c | choice_d
+//   - Optional: a `hint` column (also accepted: hints, tip). Rows with hint text get
+//     a "Need a hint?" button in the quiz; rows with an empty hint cell get none.
+//   - Optional: a `graph_data` column, points as "x,y" pairs separated by ";", e.g.
+//         -2,0; 0,2; 2,4
+//     Rows with at least two valid points get a coordinate-grid graph in the quiz;
+//     a blank or unusable cell means a normal text question.
 //
 // The sheet itself must be shared as "Anyone with the link → Viewer"
 // (Share button, top-right of Google Sheets). The download URL is built in
@@ -72,19 +80,57 @@ export function parseCSV(text) {
 
 /**
  * Splits the `choices` cell into an array of answer strings.
- * Commas inside the cell separate the answers; surrounding quotes/whitespace
- * are stripped and empty entries dropped.
+ *
+ * The separator is the pipe "|":   Option A | Option B, with details | 49,000 | Option D
+ * so commas inside an answer (coordinates, "49,000", sentences) stay in that answer.
+ *
+ * Backward compatibility: a cell with NO pipe in it is split on commas instead (the old
+ * format), so a sheet that hasn't been converted yet keeps working. Such a cell could never
+ * have produced the required two choices under pipe-only rules, so the fallback can't change
+ * how a pipe-formatted cell is read.
+ *
+ * Surrounding quotes/whitespace are stripped and empty entries dropped.
  */
 export function splitChoices(cell) {
-  return String(cell ?? "")
-    .split(",")
+  const raw = String(cell ?? "");
+  const separator = raw.includes("|") ? "|" : ",";
+  return raw
+    .split(separator)
     .map((c) => c.trim().replace(/^["']+|["']+$/g, "").trim())
     .filter(Boolean);
 }
 
 /**
+ * Parses the optional `graph_data` cell into [[x, y], ...].
+ *   "-2,0; 0,2; 2,4"   points separated by ";", x and y separated by "," (or ":")
+ * Brackets and a unicode minus are tolerated: "(−2, 0); (0, 2)".
+ * Invalid points are dropped; fewer than 2 valid points returns null, and the
+ * question is then treated as a normal text question.
+ */
+export function parseGraphData(cell) {
+  const text = String(cell ?? "").trim();
+  if (!text) return null;
+
+  const points = [];
+  for (const part of text.split(/[;\n]+/)) {
+    const cleaned = part.replace(/[()[\]]/g, "").replace(/\u2212/g, "-").trim();
+    if (!cleaned) continue;
+    const nums = cleaned.split(/[,:]/).map((s) => s.trim());
+    if (nums.length !== 2 || nums.some((s) => s === "")) continue;
+    const x = Number(nums[0]);
+    const y = Number(nums[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 1e6 || Math.abs(y) > 1e6) continue;
+    points.push([x, y]);
+    if (points.length === 24) break; // plenty for a single diagram
+  }
+
+  const distinct = new Set(points.map(([x, y]) => `${x},${y}`));
+  return distinct.size >= 2 ? points : null;
+}
+
+/**
  * Converts CSV text into question objects:
- *   { id, topic, question, choices: string[], correct_answer }
+ *   { id, topic, question, choices: string[], correct_answer, hint?, graph?: [x, y][] }
  * Invalid rows are skipped. Returns [] if the text isn't a usable question
  * sheet at all (e.g. an HTML page or a missing header).
  */
@@ -101,6 +147,8 @@ export function parseQuestionsFromCSV(text) {
   const iChoices = col("choices", "options");
   const iCorrect = col("correct_answer", "answer", "correct");
   const iLetters = ["choice_a", "choice_b", "choice_c", "choice_d"].map((n) => col(n));
+  const iHint = col("hint", "hints", "tip"); // optional column: shown behind the quiz's "Need a hint?" button
+  const iGraph = col("graph_data", "graphdata", "graph"); // optional column: points for an embedded graph
 
   const hasChoices = iChoices >= 0 || iLetters.every((i) => i >= 0);
   if (iTopic < 0 || iQuestion < 0 || iCorrect < 0 || !hasChoices) return [];
@@ -121,12 +169,17 @@ export function parseQuestionsFromCSV(text) {
 
     if (!topic || !question || choices.length < 2 || !correct_answer) return; // skip bad row
 
+    const hint = iHint >= 0 ? (r[iHint] ?? "").trim() : "";
+    const graph = iGraph >= 0 ? parseGraphData(r[iGraph]) : null; // blank / unusable -> plain text question
+
     out.push({
       id: iId >= 0 && (r[iId] ?? "").trim() ? r[iId].trim() : `sheet-${n + 1}`,
       topic,
       question,
       choices,
       correct_answer,
+      ...(hint ? { hint } : {}), // only present when the sheet row has hint text
+      ...(graph ? { graph } : {}), // only present when the row has usable graph_data
     });
   });
 

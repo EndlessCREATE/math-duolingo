@@ -717,7 +717,7 @@ export function genPythagoras(L) {
 
 export const GROUP_NUMBERS = "Numbers and algebra";
 export const GROUP_SHAPES = "Relationships and shapes";
-export const GROUP_SHEET = "From your Google Sheet";
+export const GROUP_SHEET = "Others"; // heading for sheet topics no generator covers (shown uppercase: OTHERS)
 
 /** Order matters: the first matching `match` wins (so "Linear equations" never lands on "lines"). */
 export const TOPIC_DEFS = [
